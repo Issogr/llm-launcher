@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===========================================================
 # Script to launch OpenWebUI with different LLM backends
-# Supports: Local Ollama, Remote LM Studio, Ollama in container, local llama.cpp
+# Supports: Local Ollama, Remote LM Studio, Ollama in container, local llama.cpp, LocalAI
 # ===========================================================
 
 # Main variable for configuration path
@@ -64,25 +64,45 @@ show_help() {
 setup_directories() {
   info "Checking and creating necessary directories..."
   
-  # Create base directory
-  mkdir -p "${LLM_BASE_DIR}"
+  # Define all required directories
+  declare -a required_dirs=(
+    "${LLM_BASE_DIR}"
+    "${LLM_BASE_DIR}/models"
+    "${LLM_BASE_DIR}/models/ollama"
+    "${LLM_BASE_DIR}/models/llama_cpp"
+    "${LLM_BASE_DIR}/models/localai"
+    "${LLM_BASE_DIR}/data"
+    "${LLM_BASE_DIR}/data/open-webui"
+    "${LLM_BASE_DIR}/logs"
+  )
   
-  # Create directories for models
-  mkdir -p "${LLM_BASE_DIR}/models/ollama"
-  mkdir -p "${LLM_BASE_DIR}/models/llama_cpp"
+  # List of new directories created (for reporting)
+  declare -a created_dirs=()
   
-  # Create directory for data
-  mkdir -p "${LLM_BASE_DIR}/data/open-webui"
+  # Create each directory only if it doesn't exist
+  for dir in "${required_dirs[@]}"; do
+    if [ ! -d "$dir" ]; then
+      mkdir -p "$dir"
+      created_dirs+=("$dir")
+      info "Created new directory: $dir"
+    else
+      info "Directory already exists (preserved): $dir"
+    fi
+  done
   
-  # Create directory for logs (optional)
-  mkdir -p "${LLM_BASE_DIR}/logs"
+  # Report on the operation
+  if [ ${#created_dirs[@]} -eq 0 ]; then
+    success "All required directories were already present. No changes made."
+  else
+    success "Directory structure updated. Created ${#created_dirs[@]} new directories."
+  fi
   
-  success "Standard directories created successfully!"
-  echo -e "Directory structure:"
+  echo -e "Current directory structure:"
   echo -e "${CYAN}${LLM_BASE_DIR}/${NC}"
   echo -e "${CYAN}├── models/${NC}"
   echo -e "${CYAN}│   ├── ollama/${NC}"
-  echo -e "${CYAN}│   └── llama_cpp/${NC}"
+  echo -e "${CYAN}│   ├── llama_cpp/${NC}"
+  echo -e "${CYAN}│   └── localai/${NC}"
   echo -e "${CYAN}├── data/${NC}"
   echo -e "${CYAN}│   └── open-webui/${NC}"
   echo -e "${CYAN}└── logs/${NC}"
@@ -91,6 +111,25 @@ setup_directories() {
 
 # Function to create the default configuration file
 create_default_config() {
+  info "Checking configuration file status..."
+  
+  # Check if configuration file already exists
+  if [ -f "${CONFIG_FILE}" ]; then
+    warning "Configuration file already exists at ${CONFIG_FILE}"
+    echo -e -n "${YELLOW}Do you want to backup the existing file and create a new one? (y/n): ${NC}"
+    read -r choice
+    
+    if [[ $choice =~ ^[Yy]$ ]]; then
+      # Create a backup with timestamp
+      BACKUP_FILE="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+      cp "${CONFIG_FILE}" "${BACKUP_FILE}"
+      success "Existing configuration backed up to: ${BACKUP_FILE}"
+    else
+      info "Keeping existing configuration file. No changes made."
+      return 0
+    fi
+  fi
+  
   info "Creating the default configuration file..."
   
   cat > "${CONFIG_FILE}" << EOF
@@ -116,6 +155,13 @@ LM_STUDIO_PORT="1234"
 # llama.cpp local
 LLAMA_CPP_HOST="localhost"
 LLAMA_CPP_PORT="8080"
+
+# LocalAI with Intel acceleration
+LOCALAI_IMAGE="quay.io/go-skynet/local-ai:v2.27.0-sycl-f16-ffmpeg-core"
+LOCALAI_NAME="localai-container"
+LOCALAI_PORT="8080"
+LOCALAI_MODEL="gemma-3-4b-it-qat"
+LOCALAI_EXTRA_FLAGS="--threads 4"
 
 # Memory requirements (in gigabytes)
 MEMORY_LIMIT="30G"
@@ -540,6 +586,73 @@ setup_llama_cpp() {
   return 0
 }
 
+# Function to configure and start LocalAI with Intel acceleration (option 5)
+setup_localai() {
+  info "Configuring LocalAI with Intel acceleration (SYCL)..."
+  
+  # Update the image to the latest version
+  if ! update_docker_image "$LOCALAI_IMAGE" "LocalAI"; then
+    error "Unable to proceed with launching LocalAI"
+    return 1
+  fi
+  
+  # Remove the LocalAI container if it exists
+  remove_container_if_exists $LOCALAI_NAME
+  
+  # Start the LocalAI container
+  info "Starting container $LOCALAI_NAME with model $LOCALAI_MODEL..."
+  
+  # Create a models folder for LocalAI if it doesn't exist
+  mkdir -p "${LLM_BASE_DIR}/models/localai"
+  
+  # Start the LocalAI container with Intel acceleration
+  docker run -itd \
+    -p ${LOCALAI_PORT}:8080 \
+    --device=/dev/dri \
+    -v "${LLM_BASE_DIR}/models/localai:/build/models" \
+    -e DEBUG=true \
+    -e MODELS_PATH=/build/models \
+    -e THREADS=4 \
+    --privileged \
+    --name=$LOCALAI_NAME \
+    --shm-size="${SHM_SIZE}" \
+    --network=$DOCKER_NETWORK \
+    $LOCALAI_IMAGE \
+    $LOCALAI_MODEL $LOCALAI_EXTRA_FLAGS
+  
+  if [ $? -ne 0 ]; then
+    error "Unable to start container $LOCALAI_NAME"
+    exit 1
+  fi
+  
+  # Wait for LocalAI to be fully started in the container
+  info "Waiting for LocalAI to fully start in the container (15 seconds)..."
+  sleep 15
+  
+  # Configure environment variables for OpenWebUI (OpenAI compatible API)
+  # Here we're using a dummy API key, as LocalAI doesn't require a real one
+  OPENAI_API_KEY="localai"
+  
+  # For container-to-container communication, use the container name in Docker network
+  OPENAI_API_BASE_URL="http://$LOCALAI_NAME:8080/v1"
+  
+  # Prepare parameters for OpenWebUI - these are for OpenAI API, not Ollama API
+  WEBUI_ENV_PARAMS=(
+    "-e OPENAI_API_KEY=$OPENAI_API_KEY"
+    "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
+  )
+  
+  # Set extra params to empty as we're using Docker networking
+  EXTRA_PARAMS=""
+  
+  # Save the backend type for final verification
+  BACKEND_TYPE="localai"
+  BACKEND_URL="http://localhost:${LOCALAI_PORT}/v1/models"
+  
+  success "Container LocalAI avviato con successo"
+  return 0
+}
+
 # Function to start OpenWebUI
 start_open_webui() {
   info "Preparing OpenWebUI..."
@@ -626,6 +739,32 @@ verify_connectivity() {
       error "OpenWebUI cannot reach llama.cpp on the local host"
       warning "Verify that llama.cpp is started and listening on all interfaces (0.0.0.0:$LLAMA_CPP_PORT)"
     fi
+  elif [[ "$BACKEND_TYPE" == "localai" ]]; then
+    # Verify connection to LocalAI
+    docker exec $OPEN_WEBUI_NAME curl -s "${OPENAI_API_BASE_URL}/models" > /dev/null
+    if [ $? -eq 0 ]; then
+      success "OpenWebUI can reach LocalAI in the container"
+      
+      # Try to list models to confirm API connection
+      MODEL_LIST=$(docker exec $OPEN_WEBUI_NAME curl -s "${OPENAI_API_BASE_URL}/models" | grep -o '"id":[^,}]*' | head -3)
+      if [ -n "$MODEL_LIST" ]; then
+        success "LocalAI API is responding with models:"
+        echo "$MODEL_LIST"
+      fi
+    else
+      error "OpenWebUI cannot reach LocalAI"
+      warning "Verify that the LocalAI container is started correctly and exposing the API on port 8080"
+      
+      # Diagnostic information
+      info "Diagnostic information:"
+      docker logs --tail 20 $LOCALAI_NAME
+      echo
+      info "Network status:"
+      docker network inspect $DOCKER_NETWORK | grep -A 5 $LOCALAI_NAME
+      echo
+      info "Container status:"
+      docker ps | grep -E "$LOCALAI_NAME|$OPEN_WEBUI_NAME"
+    fi
   fi
 }
 
@@ -646,6 +785,9 @@ show_access_info() {
     echo -e "LM Studio API is accessible at: ${BLUE}http://$LM_STUDIO_HOST:$LM_STUDIO_PORT${NC}"
   elif [[ "$BACKEND_TYPE" == "llama-cpp" ]]; then
     echo -e "llama.cpp API is accessible at: ${BLUE}http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT${NC}"
+  elif [[ "$BACKEND_TYPE" == "localai" ]]; then
+    echo -e "LocalAI API is accessible at: ${BLUE}http://localhost:${LOCALAI_PORT}${NC}"
+    echo -e "LocalAI Container: ${BLUE}$LOCALAI_NAME${NC}"
   fi
   echo "========================================================"
 }
@@ -656,6 +798,9 @@ main() {
   echo "   🚀 OpenWebUI Configuration with LLM backend   "
   echo "========================================================"
   
+  # Flag to track if any command-line option was processed
+  local any_option_processed=false
+  
   # Check CLI args
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -665,15 +810,15 @@ main() {
         ;;
       --setup-dirs)
         setup_directories
-        exit 0
+        any_option_processed=true
         ;;
       --create-config)
         create_default_config
-        exit 0
+        any_option_processed=true
         ;;
       --edit-config)
         edit_config
-        exit 0
+        any_option_processed=true
         ;;
       *)
         error "Unrecognized option: $1"
@@ -683,6 +828,11 @@ main() {
     esac
     shift
   done
+  
+  # Exit if any command-line option was processed
+  if $any_option_processed; then
+    exit 0
+  fi
   
   # Check prerequisites
   check_prerequisites
@@ -694,12 +844,13 @@ main() {
   echo "2 - LM Studio on another PC ($LM_STUDIO_HOST:$LM_STUDIO_PORT)"
   echo "3 - Ollama in Docker container (with Intel GPU)"
   echo "4 - Local llama.cpp on $LLAMA_CPP_HOST:$LLAMA_CPP_PORT (OpenAI compatible)"
-  read -p "Enter your choice (1/2/3/4): " choice
+  echo "5 - LocalAI with Intel acceleration (SYCL)"
+  read -p "Enter your choice (1/2/3/4/5): " choice
   echo
   
   # Verify user input
-  if [[ ! "$choice" =~ ^[1-4]$ ]]; then
-    error "Invalid choice. Please enter a number from 1 to 4."
+  if [[ ! "$choice" =~ ^[1-5]$ ]]; then
+    error "Invalid choice. Please enter a number from 1 to 5."
     exit 1
   fi
   
@@ -729,6 +880,12 @@ main() {
     4)
       if ! setup_llama_cpp; then
         error "llama.cpp configuration failed"
+        exit 1
+      fi
+      ;;
+    5)
+      if ! setup_localai; then
+        error "LocalAI configuration failed"
         exit 1
       fi
       ;;
