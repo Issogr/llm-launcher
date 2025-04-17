@@ -67,11 +67,13 @@ show_help() {
   echo "  --create-config           Create or reset the default configuration file"
   echo "  --edit-config             Edit the configuration file"
   echo "  --check-network           Check Docker network status and container connectivity"
+  echo "  --stop                    Stop running containers and services started by this script"
   echo "  --non-interactive         Run with default options (must specify backend with --backend)"
   echo "  --backend=TYPE            Specify backend type: ollama, lmstudio, ollama-container, llama-cpp, localai"
   echo
   echo "Standard usage:"
   echo "  ./llm-launcher.sh          Launch normally using existing configurations"
+  echo "  ./llm-launcher.sh --stop   Stop running services and containers"
   echo
   echo "Recommended first run:"
   echo "  ./llm-launcher.sh --setup-dirs --create-config"
@@ -761,6 +763,102 @@ show_access_info() {
   echo "========================================================"
 }
 
+# Function to stop containers and services that were started
+stop_services() {
+  info "Detecting active services..."
+  local active_services=()
+  local stopped_count=0
+  local any_services_found=false
+  
+  # 1. Check OpenWebUI
+  if docker ps -q -f "name=^/${OPEN_WEBUI_NAME}$" &>/dev/null; then
+    active_services+=("OpenWebUI")
+    any_services_found=true
+  fi
+  
+  # 2. Check Ollama in container
+  if docker ps -q -f "name=^/${OLLAMA_CONTAINER_NAME}$" &>/dev/null; then
+    active_services+=("Ollama container")
+    any_services_found=true
+  fi
+  
+  # 3. Check LocalAI
+  if docker ps -q -f "name=^/${LOCALAI_NAME}$" &>/dev/null; then
+    active_services+=("LocalAI")
+    any_services_found=true
+  fi
+  
+  # 4. Check local Ollama started by the script
+  if pgrep -f "ollama serve" &>/dev/null && [[ -f "${LLM_BASE_DIR}/logs/ollama.log" ]]; then
+    active_services+=("Local Ollama")
+    any_services_found=true
+  fi
+  
+  if ! $any_services_found; then
+    info "No services started by the script are currently running."
+    return 0
+  fi
+  
+  # Show active services
+  info "Active services detected: ${active_services[*]}"
+  info "Starting shutdown procedure..."
+  
+  # Stop active services
+  for service in "${active_services[@]}"; do
+    case "$service" in
+      "OpenWebUI")
+        info "Stopping OpenWebUI container..."
+        if docker stop $OPEN_WEBUI_NAME &>/dev/null; then
+          ((stopped_count++))
+          success "OpenWebUI container stopped"
+        else
+          warning "Unable to stop OpenWebUI container"
+        fi
+        ;;
+      
+      "Ollama container")
+        info "Stopping Ollama container..."
+        if docker stop $OLLAMA_CONTAINER_NAME &>/dev/null; then
+          ((stopped_count++))
+          success "Ollama container stopped"
+        else
+          warning "Unable to stop Ollama container"
+        fi
+        ;;
+      
+      "LocalAI")
+        info "Stopping LocalAI container..."
+        if docker stop $LOCALAI_NAME &>/dev/null; then
+          ((stopped_count++))
+          success "LocalAI container stopped"
+        else
+          warning "Unable to stop LocalAI container"
+        fi
+        ;;
+      
+      "Local Ollama")
+        info "Stopping local Ollama..."
+        if systemctl stop ollama &>/dev/null; then
+          ((stopped_count++))
+          success "Local Ollama service stopped"
+        else
+          # Fallback to process kill if systemctl fails
+          warning "Unable to stop Ollama service with systemctl, trying direct process kill..."
+          if pkill -f "ollama serve"; then
+            ((stopped_count++))
+            success "Local Ollama stopped via process kill"
+          else
+            warning "Unable to stop local Ollama"
+          fi
+        fi
+        ;;
+    esac
+  done
+  
+  success "Operation completed: stopped $stopped_count services out of ${#active_services[@]}"
+  return 0
+}
+
 # Main program execution flow
 main() {
   echo "========================================================"
@@ -805,6 +903,16 @@ main() {
         ;;
       --backend=*)
         backend_choice="${1#*=}"
+        ;;
+      --stop)
+        if [ -f "${CONFIG_FILE}" ]; then
+          source "${CONFIG_FILE}"
+        else
+          error "Configuration file not found. Run --create-config first."
+          exit 1
+        fi
+        stop_services
+        exit $?
         ;;
       *)
         error "Unrecognized option: $1"
