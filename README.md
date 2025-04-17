@@ -83,12 +83,15 @@ The script will automatically:
 
 ### ⌨️ Command Line Options
 
-For more control, you can use these optional parameters:
+The script provides several command-line options for greater flexibility:
 
 - `--help, -h`: Show help information
-- `--setup-dirs`: Manually create the standard directories
-- `--create-config`: Manually create or reset the default configuration file
-- `--edit-config`: Open the configuration file in your default text editor
+- `--setup-dirs`: Create the necessary standard directories
+- `--create-config`: Create or reset the default configuration file
+- `--edit-config`: Open the configuration file in your preferred text editor
+- `--check-network`: Check Docker network status and container connectivity
+- `--non-interactive`: Run with default options (must specify backend with --backend)
+- `--backend=TYPE`: Specify backend type: ollama, lmstudio, ollama-container, llama-cpp, localai
 
 Example of advanced setup:
 ```bash
@@ -96,6 +99,9 @@ Example of advanced setup:
 ./llm-launcher.sh --setup-dirs --create-config
 ./llm-launcher.sh --edit-config
 ./llm-launcher.sh
+
+# Run in non-interactive mode with specific backend
+./llm-launcher.sh --non-interactive --backend=localai
 ```
 
 ## ⚙️ Configuration Options
@@ -104,6 +110,7 @@ The configuration file (`~/llm/llm-launcher.conf`) contains several settings you
 
 ### 🔧 General Settings
 - `DOCKER_NETWORK`: Name of the Docker network for container communication
+- `NETWORK_DIAGNOSTIC_TIMEOUT`: Timeout in seconds for network connectivity tests
 
 ### 🌐 OpenWebUI Settings
 - `OPEN_WEBUI_IMAGE`: Docker image for OpenWebUI
@@ -113,8 +120,9 @@ The configuration file (`~/llm/llm-launcher.conf`) contains several settings you
 ### 🐳 Ollama Container Settings
 - `OLLAMA_CONTAINER_IMAGE`: Docker image for Ollama
 - `OLLAMA_CONTAINER_NAME`: Container name for Ollama
-- `MEMORY_LIMIT`: Memory limit for the Ollama container
-- `SHM_SIZE`: Shared memory size for the Ollama container
+- `OLLAMA_CONTAINER_PORT`: Port for accessing Ollama's API on your host
+- `MEMORY_LIMIT`: Memory limit for the Ollama container (e.g., "30G")
+- `SHM_SIZE`: Shared memory size for the Ollama container (e.g., "20g")
 
 ### 📡 LM Studio Remote Settings
 - `LM_STUDIO_HOST`: IP address of the remote machine running LM Studio
@@ -128,20 +136,26 @@ The configuration file (`~/llm/llm-launcher.conf`) contains several settings you
 - `LOCALAI_IMAGE`: Docker image for LocalAI (with SYCL support for Intel GPUs)
 - `LOCALAI_NAME`: Container name for LocalAI
 - `LOCALAI_PORT`: Port for accessing LocalAI's API on your host
-- `LOCALAI_MODEL`: Default model to load (e.g., "phi-2")
-- `LOCALAI_EXTRA_FLAGS`: Additional flags to pass to LocalAI
+- `LOCALAI_MODEL`: Default model to load (e.g., "gemma-3-4b-it-qat")
+- `LOCALAI_EXTRA_FLAGS`: Additional flags to pass to LocalAI (e.g., "--threads 4")
 
 ## 🛠️ How It Works
 
 The script follows these steps:
 
-1. Checks prerequisites and loads the configuration
-2. Creates a Docker network for container communication
-3. Prompts for the desired backend type
-4. Configures and verifies the selected backend
-5. Pulls and starts the OpenWebUI container with appropriate settings
-6. Verifies connectivity between OpenWebUI and the backend
-7. Displays access information
+1. Processes command-line arguments for various operation modes
+2. Checks prerequisites (Docker, necessary directories, configuration)
+3. Creates a Docker network for container communication
+4. Prompts for the desired backend type (or uses specified backend in non-interactive mode)
+5. Sets up the selected backend:
+   - For local Ollama: Verifies and optionally starts Ollama service
+   - For LM Studio: Configures connection to remote instance
+   - For Ollama container: Downloads image and runs container with Intel GPU support
+   - For llama.cpp: Configures connection to local server
+   - For LocalAI: Downloads image and runs container with Intel SYCL acceleration
+6. Pulls and starts the OpenWebUI container with appropriate settings
+7. Verifies connectivity between OpenWebUI and the backend
+8. Displays access information
 
 ## 🖥️ Accessing the UI
 

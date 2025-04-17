@@ -1,45 +1,62 @@
 #!/bin/bash
 # ===========================================================
-# Script to launch OpenWebUI with different LLM backends
-# Supports: Local Ollama, Remote LM Studio, Ollama in container, local llama.cpp, LocalAI
+# LLM Launcher - Utility to configure and start OpenWebUI with various LLM backends
+# 
+# Supported backend options:
+# - Local Ollama
+# - Remote LM Studio server
+# - Ollama in Docker container with Intel GPU acceleration
+# - Local llama.cpp server
+# - LocalAI with Intel SYCL acceleration
 # ===========================================================
 
-# Main variable for configuration path
+# Enable better error detection and handling
+set -o pipefail
+trap cleanup EXIT
+
+# Base paths for configuration and data
 LLM_BASE_DIR="${HOME}/llm"
 CONFIG_FILE="${LLM_BASE_DIR}/llm-launcher.conf"
 
-# Colors to improve output
+# Terminal color definitions for better UX
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Function to print error messages
-error() {
-  echo -e "${RED}ERROR: $1${NC}" >&2
-  echo
+# Standardized output functions
+error() { echo -e "${RED}ERROR: $1${NC}" >&2; echo; }
+success() { echo -e "${GREEN}SUCCESS: $1${NC}"; echo; }
+warning() { echo -e "${YELLOW}WARNING: $1${NC}"; echo; }
+info() { echo -e "${BLUE}INFO: $1${NC}"; }
+
+# Executed when script exits for any reason
+cleanup() {
+  # Can be extended with container cleanup if needed
+  return 0
 }
 
-# Function to print success messages
-success() {
-  echo -e "${GREEN}SUCCESS: $1${NC}"
-  echo
+# Prompt user with timeout to prevent script hanging indefinitely
+prompt_with_timeout() {
+  local prompt="$1"
+  local timeout="${2:-30}"  # Default timeout in seconds
+  local default="${3:-n}"   # Default answer if timeout occurs
+  
+  echo -e -n "$prompt "
+  read -t "$timeout" -r response || true
+  
+  if [ -z "$response" ]; then
+    echo -e "\nUsing default: $default"
+    response="$default"
+  fi
+  
+  [[ $response =~ ^[Yy]$ ]]
+  return $?
 }
 
-# Function to print warnings
-warning() {
-  echo -e "${YELLOW}WARNING: $1${NC}"
-  echo
-}
-
-# Function to print information
-info() {
-  echo -e "${BLUE}INFO: $1${NC}"
-}
-
-# Help function
+# Display usage instructions and available options
 show_help() {
   echo -e "${CYAN}========== LLM Launcher Help ==========${NC}"
   echo "This script launches OpenWebUI with different LLM backends."
@@ -49,6 +66,9 @@ show_help() {
   echo "  --setup-dirs              Create the necessary standard directories"
   echo "  --create-config           Create or reset the default configuration file"
   echo "  --edit-config             Edit the configuration file"
+  echo "  --check-network           Check Docker network status and container connectivity"
+  echo "  --non-interactive         Run with default options (must specify backend with --backend)"
+  echo "  --backend=TYPE            Specify backend type: ollama, lmstudio, ollama-container, llama-cpp, localai"
   echo
   echo "Standard usage:"
   echo "  ./llm-launcher.sh          Launch normally using existing configurations"
@@ -60,53 +80,37 @@ show_help() {
   echo -e "${CYAN}=====================================${NC}"
 }
 
-# Function to verify and create necessary directories
+# Create the standard directory structure for model and data storage
 setup_directories() {
   info "Checking and creating necessary directories..."
   
-  # Define all required directories
-  declare -a required_dirs=(
-    "${LLM_BASE_DIR}"
-    "${LLM_BASE_DIR}/models"
-    "${LLM_BASE_DIR}/models/ollama"
-    "${LLM_BASE_DIR}/models/llama_cpp"
-    "${LLM_BASE_DIR}/models/localai"
-    "${LLM_BASE_DIR}/data"
-    "${LLM_BASE_DIR}/data/open-webui"
-    "${LLM_BASE_DIR}/logs"
+  # Standard directory structure for all supported backends
+  local required_dirs=(
+    "${LLM_BASE_DIR}"                    # Base directory
+    "${LLM_BASE_DIR}/models"             # All models
+    "${LLM_BASE_DIR}/models/ollama"      # Ollama models
+    "${LLM_BASE_DIR}/models/llama_cpp"   # llama.cpp models
+    "${LLM_BASE_DIR}/models/localai"     # LocalAI models
+    "${LLM_BASE_DIR}/data"               # All application data
+    "${LLM_BASE_DIR}/data/open-webui"    # OpenWebUI persistent data
+    "${LLM_BASE_DIR}/logs"               # Log files
   )
   
-  # List of new directories created (for reporting)
-  declare -a created_dirs=()
+  local created_count=0
   
-  # Create each directory only if it doesn't exist
   for dir in "${required_dirs[@]}"; do
     if [ ! -d "$dir" ]; then
       mkdir -p "$dir"
-      created_dirs+=("$dir")
+      ((created_count++))
       info "Created new directory: $dir"
-    else
-      info "Directory already exists (preserved): $dir"
     fi
   done
   
-  # Report on the operation
-  if [ ${#created_dirs[@]} -eq 0 ]; then
-    success "All required directories were already present. No changes made."
+  if [ $created_count -eq 0 ]; then
+    success "All required directories were already present."
   else
-    success "Directory structure updated. Created ${#created_dirs[@]} new directories."
+    success "Directory structure updated. Created $created_count new directories."
   fi
-  
-  echo -e "Current directory structure:"
-  echo -e "${CYAN}${LLM_BASE_DIR}/${NC}"
-  echo -e "${CYAN}├── models/${NC}"
-  echo -e "${CYAN}│   ├── ollama/${NC}"
-  echo -e "${CYAN}│   ├── llama_cpp/${NC}"
-  echo -e "${CYAN}│   └── localai/${NC}"
-  echo -e "${CYAN}├── data/${NC}"
-  echo -e "${CYAN}│   └── open-webui/${NC}"
-  echo -e "${CYAN}└── logs/${NC}"
-  echo
 }
 
 # Function to create the default configuration file
@@ -115,17 +119,13 @@ create_default_config() {
   
   # Check if configuration file already exists
   if [ -f "${CONFIG_FILE}" ]; then
-    warning "Configuration file already exists at ${CONFIG_FILE}"
-    echo -e -n "${YELLOW}Do you want to backup the existing file and create a new one? (y/n): ${NC}"
-    read -r choice
-    
-    if [[ $choice =~ ^[Yy]$ ]]; then
+    if prompt_with_timeout "${YELLOW}Configuration file exists. Backup and create new one? (y/n):${NC}" 10; then
       # Create a backup with timestamp
-      BACKUP_FILE="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+      local BACKUP_FILE="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
       cp "${CONFIG_FILE}" "${BACKUP_FILE}"
       success "Existing configuration backed up to: ${BACKUP_FILE}"
     else
-      info "Keeping existing configuration file. No changes made."
+      info "Keeping existing configuration file."
       return 0
     fi
   fi
@@ -147,6 +147,7 @@ OPEN_WEBUI_PORT="3000"
 # Ollama in container
 OLLAMA_CONTAINER_IMAGE="intelanalytics/ipex-llm-inference-cpp-xpu:latest"
 OLLAMA_CONTAINER_NAME="ollama-container"
+OLLAMA_CONTAINER_PORT="11434"
 
 # LM Studio remote
 LM_STUDIO_HOST="192.168.1.154"
@@ -157,7 +158,7 @@ LLAMA_CPP_HOST="localhost"
 LLAMA_CPP_PORT="8080"
 
 # LocalAI with Intel acceleration
-LOCALAI_IMAGE="quay.io/go-skynet/local-ai:v2.27.0-sycl-f16-ffmpeg-core"
+LOCALAI_IMAGE="localai/localai:v2.27.0-sycl-f16-ffmpeg"
 LOCALAI_NAME="localai-container"
 LOCALAI_PORT="8080"
 LOCALAI_MODEL="gemma-3-4b-it-qat"
@@ -166,6 +167,9 @@ LOCALAI_EXTRA_FLAGS="--threads 4"
 # Memory requirements (in gigabytes)
 MEMORY_LIMIT="30G"
 SHM_SIZE="20g"
+
+# Network diagnostics
+NETWORK_DIAGNOSTIC_TIMEOUT="2" # seconds for timeout in connectivity tests
 EOF
 
   success "Configuration file created at: ${CONFIG_FILE}"
@@ -190,7 +194,7 @@ edit_config() {
     vi "${CONFIG_FILE}"
   else
     error "No text editor found. Install nano, vim or set the \$EDITOR variable."
-    exit 1
+    return 1
   fi
   
   success "Configuration modified."
@@ -203,41 +207,35 @@ check_prerequisites() {
   # Check if docker is installed
   if ! command -v docker &> /dev/null; then
     error "Docker is not installed. Install it before running this script."
-    exit 1
+    return 1
   fi
   
   # Check if docker is running
   if ! docker info &> /dev/null; then
     error "Docker service is not running. Start it with 'sudo systemctl start docker'."
-    exit 1
+    return 1
   fi
   
   # Check basic directories
   if [ ! -d "${LLM_BASE_DIR}" ]; then
-    warning "Base directory ${LLM_BASE_DIR} not found. Do you want to create the standard directories? (y/n)"
-    read -r choice
-    if [[ $choice =~ ^[Yy]$ ]]; then
+    if prompt_with_timeout "${YELLOW}Base directory ${LLM_BASE_DIR} not found. Create standard directories? (y/n)${NC}" 10; then
       setup_directories
     else
       error "Base directories not found. Run the command with --setup-dirs before continuing."
-      exit 1
+      return 1
     fi
   fi
   
   # Check configuration file
   if [ ! -f "${CONFIG_FILE}" ]; then
-    warning "Configuration file not found. Do you want to create it now? (y/n)"
-    read -r choice
-    if [[ $choice =~ ^[Yy]$ ]]; then
+    if prompt_with_timeout "${YELLOW}Configuration file not found. Create it now? (y/n)${NC}" 10; then
       create_default_config
-      info "Do you want to edit the configuration file before continuing? (y/n)"
-      read -r edit_choice
-      if [[ $edit_choice =~ ^[Yy]$ ]]; then
+      if prompt_with_timeout "${YELLOW}Edit the configuration file before continuing? (y/n)${NC}" 10; then
         edit_config
       fi
     else
       error "Configuration file not found. Run the command with --create-config before continuing."
-      exit 1
+      return 1
     fi
   fi
   
@@ -245,69 +243,35 @@ check_prerequisites() {
   source "${CONFIG_FILE}"
   
   success "Prerequisites verified"
+  return 0
 }
 
-# Function to update a Docker image to the latest version
+# Pull latest Docker image or use existing local image if download fails
 update_docker_image() {
   local image_name="$1"
   local friendly_name="$2"
   
   info "Checking updates for $friendly_name ($image_name)..."
   
-  # Check if the image already exists locally
+  # Check if we already have a local copy
   local image_exists_locally=false
   if docker image inspect "$image_name" &>/dev/null; then
     image_exists_locally=true
-    local old_digest=$(docker image inspect --format='{{index .RepoDigests 0}}' "$image_name" 2>/dev/null || echo "")
     info "$friendly_name image found locally"
   else
     info "$friendly_name image not found locally"
   fi
   
-  # Check if the image is available online (with timeout)
-  local image_available_online=false
-  info "Checking online availability of $friendly_name..."
-  
-  # First try to inspect the repository (faster than pull)
-  if timeout 15s docker manifest inspect "$image_name" &>/dev/null; then
-    image_available_online=true
-    info "$friendly_name image available online"
-  else
-    warning "$friendly_name image not available online or connection problems"
+  # Try to download latest version with 30s timeout
+  if timeout 30s docker pull "$image_name"; then
+    success "$friendly_name image updated/downloaded successfully"
+    return 0
   fi
   
-  # Handle different cases
-  if $image_available_online; then
-    # The image is available online, proceed with download
-    info "Downloading the latest version of $friendly_name..."
-    
-    if docker pull "$image_name"; then
-      # Check if the image has been updated
-      if $image_exists_locally; then
-        local new_digest=$(docker image inspect --format='{{index .RepoDigests 0}}' "$image_name" 2>/dev/null || echo "")
-        
-        if [ -n "$old_digest" ] && [ "$old_digest" != "$new_digest" ]; then
-          success "$friendly_name updated to the latest version"
-        else
-          info "$friendly_name is already at the latest version"
-        fi
-      else
-        success "$friendly_name downloaded successfully"
-      fi
-      return 0
-    else
-      warning "Download failed for $friendly_name despite appearing to be available online"
-      # Continue with the code below to use the local version
-    fi
-  fi
-  
-  # If we get here, the image is not available online or the download failed
+  # Handle download failure
   if $image_exists_locally; then
-    # Ask the user if they want to use the local image
-    echo -e -n "${YELLOW}The $friendly_name image is not available online. Do you want to use the local version? (y/n): ${NC}"
-    read -r use_local
-    
-    if [[ $use_local =~ ^[Yy]$ ]]; then
+    # We have a local copy, ask if user wants to use it
+    if prompt_with_timeout "${YELLOW}Failed to download $friendly_name. Use local version? (y/n):${NC}" 10 "y"; then
       info "Using the local version of $friendly_name"
       return 0
     else
@@ -315,9 +279,7 @@ update_docker_image() {
       return 1
     fi
   else
-    # It doesn't exist either online or locally
     error "The $friendly_name image is not available either online or locally"
-    error "Operation cancelled"
     return 1
   fi
 }
@@ -328,16 +290,80 @@ create_docker_network() {
   
   if ! docker network inspect $DOCKER_NETWORK &>/dev/null; then
     info "Creating Docker network '$DOCKER_NETWORK'..."
-    docker network create $DOCKER_NETWORK
-    if [ $? -eq 0 ]; then
+    if docker network create $DOCKER_NETWORK; then
       success "Docker network '$DOCKER_NETWORK' created"
     else
       error "Unable to create Docker network '$DOCKER_NETWORK'"
-      exit 1
+      return 1
     fi
   else
     info "Docker network '$DOCKER_NETWORK' already exists"
   fi
+  
+  return 0
+}
+
+# Diagnostic tool to check Docker network configuration and container connectivity
+check_network_status() {
+  info "Checking Docker network status..."
+
+  # Verify network exists
+  if ! docker network inspect $DOCKER_NETWORK &>/dev/null; then
+    error "Docker network '$DOCKER_NETWORK' does not exist"
+    info "Run the script normally to create the network first"
+    return 1
+  fi
+
+  # Show network configuration
+  echo -e "${CYAN}Network details:${NC}"
+  docker network inspect $DOCKER_NETWORK | grep -A 2 "Name\|Driver\|Subnet"
+  echo
+
+  # Get list of containers in this network
+  echo -e "${CYAN}Containers in network $DOCKER_NETWORK:${NC}"
+  local CONTAINERS=$(docker network inspect $DOCKER_NETWORK | grep -o '"Name": "[^"]*' | grep -v "Name.*:" | cut -d'"' -f4)
+  
+  if [ -z "$CONTAINERS" ]; then
+    echo "No containers found in network $DOCKER_NETWORK"
+    return 0
+  fi
+
+  # Show container IP addresses
+  echo "$CONTAINERS" | while read container; do
+    local CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $container 2>/dev/null || echo "Not running")
+    echo -e "$container: ${BLUE}$CONTAINER_IP${NC}"
+  done
+  echo
+
+  # Test container-to-container connectivity
+  echo -e "${CYAN}Testing basic network connectivity:${NC}"
+  local container_array=()
+  while read -r line; do
+    container_array+=("$line")
+  done <<< "$CONTAINERS"
+
+  # Test each pair of containers
+  for ((i=0; i<${#container_array[@]}; i++)); do
+    for ((j=i+1; j<${#container_array[@]}; j++)); do
+      local container1=${container_array[$i]}
+      local container2=${container_array[$j]}
+      
+      # Skip if containers aren't running
+      if ! docker ps -q -f "name=$container1" &>/dev/null || ! docker ps -q -f "name=$container2" &>/dev/null; then
+        echo -e "$container1 <-> $container2: ${YELLOW}One or both containers not running${NC}"
+        continue
+      fi
+      
+      # Test ping with timeout
+      if docker exec $container1 timeout $NETWORK_DIAGNOSTIC_TIMEOUT ping -c 1 $container2 &>/dev/null; then
+        echo -e "$container1 -> $container2: ${GREEN}Network connectivity OK${NC}"
+      else
+        echo -e "$container1 -> $container2: ${YELLOW}Network connectivity issue${NC}"
+      fi
+    done
+  done
+  
+  return 0
 }
 
 # Function to check and remove existing containers
@@ -346,62 +372,41 @@ remove_container_if_exists() {
   
   if [ "$(docker ps -aq -f name=^/${container_name}$)" ]; then
     info "Removing existing '$container_name' container..."
-    docker rm -f $container_name
-    if [ $? -eq 0 ]; then
+    if docker rm -f $container_name &>/dev/null; then
       success "Container '$container_name' removed"
     else
       error "Unable to remove container '$container_name'"
-      exit 1
+      return 1
     fi
   fi
+  
+  return 0
 }
 
 # Function to configure and launch local Ollama (option 1)
 setup_local_ollama() {
   info "Configuring Ollama on the local host..."
   
-  # Configure environment variables for OpenWebUI
-  OLLAMA_HOST_VAR="host.docker.internal"
-  OLLAMA_URL_VAR="http://host.docker.internal:11434"
-  EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
-  
   # Verify if Ollama is running on the host
-  if ! curl -s http://localhost:11434/api/version > /dev/null; then
+  if ! curl -s --connect-timeout 2 http://localhost:11434/api/version > /dev/null; then
     warning "Cannot connect to Ollama on the local host."
     
     # Check if Ollama is installed
     if ! command -v ollama &> /dev/null; then
-      error "Ollama does not appear to be installed on the system."
-      warning "Install Ollama by following the instructions at https://ollama.ai/ before continuing."
-      warning "Proceeding with launching OpenWebUI anyway..."
+      warning "Ollama does not appear to be installed on the system."
+      warning "Install Ollama from https://ollama.ai/ before continuing."
+      
+      if ! prompt_with_timeout "${YELLOW}Continue without Ollama? (y/n):${NC}" 10; then
+        return 1
+      fi
     else
-      echo -e -n "${YELLOW}Do you want to try starting the Ollama service? (y/n): ${NC}"
-      read -r restart_choice
-      if [[ $restart_choice =~ ^[Yy]$ ]]; then
-        info "Attempting to start the Ollama service..."
+      if prompt_with_timeout "${YELLOW}Try starting Ollama service? (y/n):${NC}" 10; then
+        info "Attempting to start Ollama service..."
         
-        # Try to identify the startup method on Linux
-        if systemctl --version &>/dev/null; then
-          # System with systemd
-          if systemctl list-unit-files | grep -q ollama; then
-            info "Starting Ollama via systemd..."
-            sudo systemctl start ollama
-          else
-            info "Systemd service for Ollama not found, trying to start it manually..."
-            nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
-          fi
-        elif service --version &>/dev/null || which service &>/dev/null; then
-          # System with service/init.d
-          if [ -f /etc/init.d/ollama ]; then
-            info "Starting Ollama via service..."
-            sudo service ollama start
-          else
-            info "Init.d service for Ollama not found, trying to start it manually..."
-            nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
-          fi
+        # Simplified service startup logic
+        if systemctl --version &>/dev/null && systemctl list-unit-files | grep -q ollama; then
+          sudo systemctl start ollama
         else
-          # Fallback - manual start
-          info "Manual start of Ollama..."
           mkdir -p ${LLM_BASE_DIR}/logs
           nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
         fi
@@ -409,32 +414,40 @@ setup_local_ollama() {
         info "Waiting for Ollama to start (5 seconds)..."
         sleep 5
         
-        # Verify connection again
-        if ! curl -s http://localhost:11434/api/version > /dev/null; then
-          error "Unable to start Ollama. Verify the installation."
-          warning "If you just installed it, you might need to restart the system."
-          warning "Proceeding with launching OpenWebUI anyway..."
+        if ! curl -s --connect-timeout 2 http://localhost:11434/api/version > /dev/null; then
+          warning "Unable to start Ollama. Verify the installation."
+          
+          if ! prompt_with_timeout "${YELLOW}Continue without active Ollama? (y/n):${NC}" 10; then
+            return 1
+          fi
         else
           success "Ollama started successfully!"
         fi
-      else
-        warning "Proceeding with launching OpenWebUI without active Ollama..."
+      elif ! prompt_with_timeout "${YELLOW}Continue without active Ollama? (y/n):${NC}" 10; then
+        return 1
       fi
     fi
   else
     success "Connection to Ollama on host verified"
   fi
   
+  # Configure environment variables for OpenWebUI
+  OLLAMA_HOST_VAR="host.docker.internal"
+  OLLAMA_URL_VAR="http://host.docker.internal:11434"
+  EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
+  
   # Prepare parameters for OpenWebUI
   WEBUI_ENV_PARAMS=(
     "-e OLLAMA_BASE_URL=$OLLAMA_URL_VAR"
     "-e OLLAMA_API_HOST=$OLLAMA_HOST_VAR"
-    "-e OLLAMA_API_PORT=${OLLAMA_URL_VAR##*:}"
+    "-e OLLAMA_API_PORT=11434"
   )
   
   # Save the backend type for final verification
   BACKEND_TYPE="ollama"
   BACKEND_URL="http://localhost:11434"
+  
+  return 0
 }
 
 # Function to configure remote LM Studio (option 2)
@@ -442,25 +455,20 @@ setup_lm_studio() {
   info "Configuring to use LM Studio on another PC ($LM_STUDIO_HOST:$LM_STUDIO_PORT)..."
   
   # Configuration for LM Studio (OpenAI compatible API)
-  OPENAI_API_KEY="lm-studio"  # Can be any value
+  OPENAI_API_KEY="lm-studio"  # Any value works
   OPENAI_API_HOST=$LM_STUDIO_HOST
   OPENAI_API_PORT=$LM_STUDIO_PORT
   OPENAI_API_BASE_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1"
   EXTRA_PARAMS=""
   
-  # Check if LM Studio is reachable on the remote PC
-  if ! curl -s "http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models" > /dev/null; then
+  # Check connection with timeout
+  if ! curl -s --connect-timeout 3 "http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models" > /dev/null; then
     warning "Cannot connect to LM Studio on $LM_STUDIO_HOST:$LM_STUDIO_PORT"
     warning "Make sure it is running and accessible from the network."
     
-    echo -e -n "${YELLOW}Do you want to continue anyway? (y/n): ${NC}"
-    read -r continue_choice
-    if ! [[ $continue_choice =~ ^[Yy]$ ]]; then
-      error "LM Studio configuration cancelled"
+    if ! prompt_with_timeout "${YELLOW}Continue anyway? (y/n):${NC}" 10; then
       return 1
     fi
-    
-    warning "Proceeding with launching OpenWebUI anyway..."
   else
     success "Connection to LM Studio on remote PC verified"
   fi
@@ -484,42 +492,36 @@ setup_lm_studio() {
 setup_ollama_container() {
   info "Configuring Ollama in Docker container..."
   
-  # Update the image to the latest version
+  # Update the image and handle errors
   if ! update_docker_image "$OLLAMA_CONTAINER_IMAGE" "Ollama Container"; then
-    error "Unable to proceed with launching Ollama in container"
     return 1
   fi
   
   # Remove the Ollama container if it exists
-  remove_container_if_exists $OLLAMA_CONTAINER_NAME
+  if ! remove_container_if_exists $OLLAMA_CONTAINER_NAME; then
+    return 1
+  fi
   
-  # Start the Ollama container
+  # Start the Ollama container with simplified command
   info "Starting container $OLLAMA_CONTAINER_NAME..."
-  docker run -itd \
-    -p 11434:11434 \
+  if ! docker run -itd \
+    -p $OLLAMA_CONTAINER_PORT:11434 \
     --device=/dev/dri \
     -v "${LLM_BASE_DIR}/models/ollama:/root/.ollama/models" \
-    -e no_proxy=localhost,127.0.0.1 \
-    -e ZES_ENABLE_SYSMAN=1 \
-    -e OLLAMA_INTEL_GPU=true \
-    -e ONEAPI_DEVICE_SELECTOR=level_zero:0 \
     -e OLLAMA_HOST=0.0.0.0 \
     --memory="${MEMORY_LIMIT}" \
     --name=$OLLAMA_CONTAINER_NAME \
-    -e bench_model="phi4" \
-    -e DEVICE=iGPU \
     --shm-size="${SHM_SIZE}" \
     --network=$DOCKER_NETWORK \
     $OLLAMA_CONTAINER_IMAGE \
-    bash -c 'ln -s /llm/ollama/ollama /usr/local/bin/ollama && cd /llm/scripts && source ipex-llm-init --gpu --device $DEVICE && bash start-ollama.sh && tail -f /dev/null'
-  
-  if [ $? -ne 0 ]; then
+    bash -c 'ln -s /llm/ollama/ollama /usr/local/bin/ollama && cd /llm/scripts && source ipex-llm-init --gpu --device iGPU && bash start-ollama.sh && tail -f /dev/null'; then
+    
     error "Unable to start container $OLLAMA_CONTAINER_NAME"
-    exit 1
+    return 1
   fi
   
-  # Wait for Ollama to be fully started in the container
-  info "Waiting for Ollama to fully start in the container (15 seconds)..."
+  # Wait for Ollama to start
+  info "Waiting for Ollama to start in the container (15 seconds)..."
   sleep 15
   
   # Configure environment variables for OpenWebUI
@@ -547,26 +549,20 @@ setup_llama_cpp() {
   info "Configuring connection to local llama.cpp ($LLAMA_CPP_HOST:$LLAMA_CPP_PORT)..."
   
   # Configuration for llama.cpp (OpenAI compatible API)
-  OPENAI_API_KEY="llama-cpp"  # Can be any value
+  OPENAI_API_KEY="llama-cpp"  # Any value works
   OPENAI_API_HOST="host.docker.internal"
   OPENAI_API_PORT=$LLAMA_CPP_PORT
   OPENAI_API_BASE_URL="http://host.docker.internal:$LLAMA_CPP_PORT/v1"
   EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
   
-  # Check if llama.cpp is reachable on the local host
-  if ! curl -s "http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/models" > /dev/null; then
+  # Check connection with timeout
+  if ! curl -s --connect-timeout 3 "http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/models" > /dev/null; then
     warning "Cannot connect to llama.cpp on $LLAMA_CPP_HOST:$LLAMA_CPP_PORT"
     warning "Make sure llama.cpp is running with the server enabled"
-    warning "Example command: ./llama.cpp/build/bin/server -m model.gguf -c 4096 --host 0.0.0.0 --port $LLAMA_CPP_PORT"
     
-    echo -e -n "${YELLOW}Do you want to continue anyway? (y/n): ${NC}"
-    read -r continue_choice
-    if ! [[ $continue_choice =~ ^[Yy]$ ]]; then
-      error "llama.cpp configuration cancelled"
+    if ! prompt_with_timeout "${YELLOW}Continue anyway? (y/n):${NC}" 10; then
       return 1
     fi
-    
-    warning "Proceeding with launching OpenWebUI anyway..."
   else
     success "Connection to llama.cpp on local host verified"
   fi
@@ -590,53 +586,47 @@ setup_llama_cpp() {
 setup_localai() {
   info "Configuring LocalAI with Intel acceleration (SYCL)..."
   
-  # Update the image to the latest version
+  # Update the image and handle errors
   if ! update_docker_image "$LOCALAI_IMAGE" "LocalAI"; then
-    error "Unable to proceed with launching LocalAI"
     return 1
   fi
   
   # Remove the LocalAI container if it exists
-  remove_container_if_exists $LOCALAI_NAME
+  if ! remove_container_if_exists $LOCALAI_NAME; then
+    return 1
+  fi
   
-  # Start the LocalAI container
-  info "Starting container $LOCALAI_NAME with model $LOCALAI_MODEL..."
-  
-  # Create a models folder for LocalAI if it doesn't exist
+  # Create models directory
   mkdir -p "${LLM_BASE_DIR}/models/localai"
   
-  # Start the LocalAI container with Intel acceleration
-  docker run -itd \
+  # Start the LocalAI container with simplified command
+  info "Starting container $LOCALAI_NAME with model $LOCALAI_MODEL..."
+  if ! docker run -itd \
     -p ${LOCALAI_PORT}:8080 \
     --device=/dev/dri \
     -v "${LLM_BASE_DIR}/models/localai:/build/models" \
     -e DEBUG=true \
     -e MODELS_PATH=/build/models \
-    -e THREADS=4 \
-    --privileged \
+    -e THREADS=1 \
     --name=$LOCALAI_NAME \
     --shm-size="${SHM_SIZE}" \
     --network=$DOCKER_NETWORK \
     $LOCALAI_IMAGE \
-    $LOCALAI_MODEL $LOCALAI_EXTRA_FLAGS
-  
-  if [ $? -ne 0 ]; then
+    $LOCALAI_MODEL $LOCALAI_EXTRA_FLAGS; then
+    
     error "Unable to start container $LOCALAI_NAME"
-    exit 1
+    return 1
   fi
   
-  # Wait for LocalAI to be fully started in the container
-  info "Waiting for LocalAI to fully start in the container (15 seconds)..."
+  # Wait for LocalAI to start
+  info "Waiting for LocalAI to start in the container (15 seconds)..."
   sleep 15
   
-  # Configure environment variables for OpenWebUI (OpenAI compatible API)
-  # Here we're using a dummy API key, as LocalAI doesn't require a real one
+  # Configure environment variables for OpenWebUI
   OPENAI_API_KEY="localai"
-  
-  # For container-to-container communication, use the container name in Docker network
   OPENAI_API_BASE_URL="http://$LOCALAI_NAME:8080/v1"
   
-  # Prepare parameters for OpenWebUI - these are for OpenAI API, not Ollama API
+  # Prepare parameters for OpenWebUI
   WEBUI_ENV_PARAMS=(
     "-e OPENAI_API_KEY=$OPENAI_API_KEY"
     "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
@@ -649,122 +639,93 @@ setup_localai() {
   BACKEND_TYPE="localai"
   BACKEND_URL="http://localhost:${LOCALAI_PORT}/v1/models"
   
-  success "Container LocalAI avviato con successo"
+  success "LocalAI container started successfully"
   return 0
 }
 
-# Function to start OpenWebUI
+# Launch the OpenWebUI container with appropriate backend configuration
 start_open_webui() {
   info "Preparing OpenWebUI..."
   
-  # Update the image to the latest version
+  # Get latest image or verify local image is available
   if ! update_docker_image "$OPEN_WEBUI_IMAGE" "OpenWebUI"; then
-    error "Unable to proceed with launching OpenWebUI"
-    exit 1
+    return 1
   fi
   
-  # Remove the container if it already exists
-  remove_container_if_exists $OPEN_WEBUI_NAME
+  # Remove existing container to avoid conflicts
+  if ! remove_container_if_exists $OPEN_WEBUI_NAME; then
+    return 1
+  fi
   
-  # Start the OpenWebUI container
   info "Starting container $OPEN_WEBUI_NAME..."
   
-  # Build the docker run command with the correct parameters
-  docker_cmd="docker run -d \
-    -p ${OPEN_WEBUI_PORT}:8080 \
-    ${WEBUI_ENV_PARAMS[*]} \
-    -v ${LLM_BASE_DIR}/data/open-webui:/app/backend/data \
-    --name $OPEN_WEBUI_NAME \
-    --network=$DOCKER_NETWORK"
+  # Use array for Docker run command (cleaner than string concatenation)
+  local docker_args=(
+    "run" "-d"
+    "-p" "${OPEN_WEBUI_PORT}:8080"
+    "-v" "${LLM_BASE_DIR}/data/open-webui:/app/backend/data"
+    "--name" "$OPEN_WEBUI_NAME"
+    "--network=$DOCKER_NETWORK"
+  )
   
-  # Add any extra parameters
+  # Add all environment variables from backend setup
+  for param in "${WEBUI_ENV_PARAMS[@]}"; do
+    docker_args+=($param)
+  done
+  
+  # Add host mapping or other extra parameters if needed
   if [ -n "$EXTRA_PARAMS" ]; then
-    docker_cmd="$docker_cmd $EXTRA_PARAMS"
+    local extra_args=($EXTRA_PARAMS)
+    docker_args+=("${extra_args[@]}")
   fi
   
-  # Add the image
-  docker_cmd="$docker_cmd $OPEN_WEBUI_IMAGE"
+  # Add the image name as the final parameter
+  docker_args+=("$OPEN_WEBUI_IMAGE")
   
-  # Execute the command
-  eval $docker_cmd
-  
-  if [ $? -ne 0 ]; then
+  # Launch container
+  if ! docker "${docker_args[@]}"; then
     error "Unable to start container $OPEN_WEBUI_NAME"
-    exit 1
+    return 1
   fi
   
   success "OpenWebUI started successfully"
+  return 0
 }
 
-# Function to verify connectivity between OpenWebUI and the backend
+# Test connectivity between OpenWebUI and the selected LLM backend
 verify_connectivity() {
   info "Verifying connectivity between OpenWebUI and the backend..."
   
-  sleep 5  # Wait for the container to be fully started
+  # Allow container time to initialize networking
+  sleep 5
   
-  # Verify connection to the backend based on the selected type
-  if [[ "$BACKEND_TYPE" == "ollama" ]]; then
-    # Verify connection to Ollama on the host
-    docker exec $OPEN_WEBUI_NAME curl -s $OLLAMA_URL_VAR/api/version > /dev/null
-    if [ $? -eq 0 ]; then
-      success "OpenWebUI can reach Ollama on the host"
-    else
-      error "OpenWebUI cannot reach Ollama on the host"
-      warning "Verify that Ollama is started and listening on all interfaces (0.0.0.0)"
-    fi
-  elif [[ "$BACKEND_TYPE" == "ollama-container" ]]; then
-    # Verify connection to Ollama in the container
-    docker exec $OPEN_WEBUI_NAME curl -s $BACKEND_URL > /dev/null
-    if [ $? -eq 0 ]; then
-      success "OpenWebUI can reach Ollama in the container"
-    else
-      error "OpenWebUI cannot reach Ollama in the container"
-      warning "Verify that the Ollama container is started correctly and exposing the API on port 11434"
-    fi
-  elif [[ "$BACKEND_TYPE" == "lmstudio" ]]; then
-    # Verify connection to LM Studio on the remote PC
-    docker exec $OPEN_WEBUI_NAME curl -s $BACKEND_URL > /dev/null
-    if [ $? -eq 0 ]; then
-      success "OpenWebUI can reach LM Studio on the remote PC"
-    else
-      error "OpenWebUI cannot reach LM Studio on the remote PC"
-      warning "Verify that LM Studio is started on the remote PC and is accessible from this host"
-    fi
-  elif [[ "$BACKEND_TYPE" == "llama-cpp" ]]; then
-    # Verify connection to llama.cpp on the local host
-    docker exec $OPEN_WEBUI_NAME curl -s $BACKEND_URL > /dev/null
-    if [ $? -eq 0 ]; then
-      success "OpenWebUI can reach llama.cpp on the local host"
-    else
-      error "OpenWebUI cannot reach llama.cpp on the local host"
-      warning "Verify that llama.cpp is started and listening on all interfaces (0.0.0.0:$LLAMA_CPP_PORT)"
-    fi
-  elif [[ "$BACKEND_TYPE" == "localai" ]]; then
-    # Verify connection to LocalAI
-    docker exec $OPEN_WEBUI_NAME curl -s "${OPENAI_API_BASE_URL}/models" > /dev/null
-    if [ $? -eq 0 ]; then
-      success "OpenWebUI can reach LocalAI in the container"
-      
-      # Try to list models to confirm API connection
-      MODEL_LIST=$(docker exec $OPEN_WEBUI_NAME curl -s "${OPENAI_API_BASE_URL}/models" | grep -o '"id":[^,}]*' | head -3)
-      if [ -n "$MODEL_LIST" ]; then
-        success "LocalAI API is responding with models:"
-        echo "$MODEL_LIST"
-      fi
-    else
-      error "OpenWebUI cannot reach LocalAI"
-      warning "Verify that the LocalAI container is started correctly and exposing the API on port 8080"
-      
-      # Diagnostic information
-      info "Diagnostic information:"
-      docker logs --tail 20 $LOCALAI_NAME
-      echo
-      info "Network status:"
-      docker network inspect $DOCKER_NETWORK | grep -A 5 $LOCALAI_NAME
-      echo
-      info "Container status:"
-      docker ps | grep -E "$LOCALAI_NAME|$OPEN_WEBUI_NAME"
-    fi
+  # Determine appropriate API endpoint to test based on backend type
+  local test_url=""
+  local test_container=$OPEN_WEBUI_NAME
+  
+  case "$BACKEND_TYPE" in
+    "ollama")
+      test_url="$OLLAMA_URL_VAR/api/version"
+      ;;
+    "ollama-container")
+      test_url="$BACKEND_URL"
+      ;;
+    "lmstudio"|"llama-cpp")
+      test_url="$BACKEND_URL"
+      ;;
+    "localai")
+      test_url="${OPENAI_API_BASE_URL}/models"
+      ;;
+  esac
+  
+  # Test API connectivity with timeout to prevent hanging
+  if docker exec $test_container timeout 5 curl -s "$test_url" > /dev/null; then
+    success "OpenWebUI can connect to the $BACKEND_TYPE backend"
+    return 0
+  else
+    warning "OpenWebUI cannot connect to the $BACKEND_TYPE backend"
+    warning "Check network settings and ensure the backend is running"
+    return 1
   fi
 }
 
@@ -776,32 +737,41 @@ show_access_info() {
   echo "========================================================"
   echo -e "OpenWebUI is accessible at: ${BLUE}http://localhost:${OPEN_WEBUI_PORT}${NC}"
   
-  if [[ "$BACKEND_TYPE" == "ollama" ]]; then
-    echo -e "Ollama API is accessible at: ${BLUE}http://localhost:11434${NC}"
-  elif [[ "$BACKEND_TYPE" == "ollama-container" ]]; then
-    echo -e "Ollama in container is accessible at: ${BLUE}http://localhost:11434${NC}"
-    echo -e "Ollama Container: ${BLUE}$OLLAMA_CONTAINER_NAME${NC}"
-  elif [[ "$BACKEND_TYPE" == "lmstudio" ]]; then
-    echo -e "LM Studio API is accessible at: ${BLUE}http://$LM_STUDIO_HOST:$LM_STUDIO_PORT${NC}"
-  elif [[ "$BACKEND_TYPE" == "llama-cpp" ]]; then
-    echo -e "llama.cpp API is accessible at: ${BLUE}http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT${NC}"
-  elif [[ "$BACKEND_TYPE" == "localai" ]]; then
-    echo -e "LocalAI API is accessible at: ${BLUE}http://localhost:${LOCALAI_PORT}${NC}"
-    echo -e "LocalAI Container: ${BLUE}$LOCALAI_NAME${NC}"
-  fi
+  case "$BACKEND_TYPE" in
+    "ollama")
+      echo -e "Ollama API is accessible at: ${BLUE}http://localhost:11434${NC}"
+      ;;
+    "ollama-container")
+      echo -e "Ollama in container is accessible at: ${BLUE}http://localhost:$OLLAMA_CONTAINER_PORT${NC}"
+      echo -e "Ollama Container: ${BLUE}$OLLAMA_CONTAINER_NAME${NC}"
+      ;;
+    "lmstudio")
+      echo -e "LM Studio API is accessible at: ${BLUE}http://$LM_STUDIO_HOST:$LM_STUDIO_PORT${NC}"
+      ;;
+    "llama-cpp")
+      echo -e "llama.cpp API is accessible at: ${BLUE}http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT${NC}"
+      ;;
+    "localai")
+      echo -e "LocalAI API is accessible at: ${BLUE}http://localhost:${LOCALAI_PORT}${NC}"
+      echo -e "LocalAI Container: ${BLUE}$LOCALAI_NAME${NC}"
+      ;;
+  esac
+  echo "========================================================"
+  echo -e "To check network connectivity run: ${CYAN}./llm-launcher.sh --check-network${NC}"
   echo "========================================================"
 }
 
-# Main function
+# Main program execution flow
 main() {
   echo "========================================================"
   echo "   🚀 OpenWebUI Configuration with LLM backend   "
   echo "========================================================"
   
-  # Flag to track if any command-line option was processed
-  local any_option_processed=false
+  # Command-line flags
+  local non_interactive=false
+  local backend_choice=""
   
-  # Check CLI args
+  # Process command-line arguments first
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --help|-h)
@@ -810,15 +780,31 @@ main() {
         ;;
       --setup-dirs)
         setup_directories
-        any_option_processed=true
+        exit 0
         ;;
       --create-config)
         create_default_config
-        any_option_processed=true
+        exit 0
         ;;
       --edit-config)
-        edit_config
-        any_option_processed=true
+        edit_config || exit 1
+        exit 0
+        ;;
+      --check-network)
+        if [ -f "${CONFIG_FILE}" ]; then
+          source "${CONFIG_FILE}"
+        else
+          error "Configuration file not found. Run --create-config first."
+          exit 1
+        fi
+        check_network_status
+        exit $?
+        ;;
+      --non-interactive)
+        non_interactive=true
+        ;;
+      --backend=*)
+        backend_choice="${1#*=}"
         ;;
       *)
         error "Unrecognized option: $1"
@@ -829,79 +815,81 @@ main() {
     shift
   done
   
-  # Exit if any command-line option was processed
-  if $any_option_processed; then
-    exit 0
-  fi
-  
-  # Check prerequisites
-  check_prerequisites
-  
-  # Ask the user which backend to use
-  echo
-  echo "Choose which backend you want to use:"
-  echo "1 - Ollama on your local host"
-  echo "2 - LM Studio on another PC ($LM_STUDIO_HOST:$LM_STUDIO_PORT)"
-  echo "3 - Ollama in Docker container (with Intel GPU)"
-  echo "4 - Local llama.cpp on $LLAMA_CPP_HOST:$LLAMA_CPP_PORT (OpenAI compatible)"
-  echo "5 - LocalAI with Intel acceleration (SYCL)"
-  read -p "Enter your choice (1/2/3/4/5): " choice
-  echo
-  
-  # Verify user input
-  if [[ ! "$choice" =~ ^[1-5]$ ]]; then
-    error "Invalid choice. Please enter a number from 1 to 5."
+  # Validate automated mode parameters
+  if $non_interactive && [[ ! "$backend_choice" =~ ^(ollama|lmstudio|ollama-container|llama-cpp|localai)$ ]]; then
+    error "Invalid or missing backend choice for non-interactive mode"
+    echo "Must specify one of: ollama, lmstudio, ollama-container, llama-cpp, localai"
     exit 1
   fi
   
-  # Create docker network
-  create_docker_network
+  # Verify environment and configuration
+  if ! check_prerequisites; then
+    exit 1
+  fi
   
-  # Configure backend based on user choice
+  # Ensure Docker network exists
+  if ! create_docker_network; then
+    exit 1
+  fi
+  
+  # Select LLM backend
+  if ! $non_interactive; then
+    # Interactive mode - show menu
+    echo
+    echo "Choose which backend you want to use:"
+    echo "1 - Ollama on your local host"
+    echo "2 - LM Studio on another PC ($LM_STUDIO_HOST:$LM_STUDIO_PORT)"
+    echo "3 - Ollama in Docker container (with Intel GPU)"
+    echo "4 - Local llama.cpp on $LLAMA_CPP_HOST:$LLAMA_CPP_PORT (OpenAI compatible)"
+    echo "5 - LocalAI with Intel acceleration (SYCL)"
+    read -p "Enter your choice (1/2/3/4/5): " choice
+    echo
+    
+    if [[ ! "$choice" =~ ^[1-5]$ ]]; then
+      error "Invalid choice. Please enter a number from 1 to 5."
+      exit 1
+    fi
+  else
+    # Non-interactive mode - map backend name to number
+    case "$backend_choice" in
+      "ollama") choice=1 ;;
+      "lmstudio") choice=2 ;;
+      "ollama-container") choice=3 ;;
+      "llama-cpp") choice=4 ;;
+      "localai") choice=5 ;;
+    esac
+  fi
+  
+  # Set up selected backend
+  local backend_setup_success=false
   case $choice in
-    1)
-      if ! setup_local_ollama; then
-        error "Local Ollama configuration failed"
-        exit 1
-      fi
-      ;;
-    2)
-      if ! setup_lm_studio; then
-        error "LM Studio configuration failed"
-        exit 1
-      fi
-      ;;
-    3)
-      if ! setup_ollama_container; then
-        error "Ollama in container configuration failed"
-        exit 1
-      fi
-      ;;
-    4)
-      if ! setup_llama_cpp; then
-        error "llama.cpp configuration failed"
-        exit 1
-      fi
-      ;;
-    5)
-      if ! setup_localai; then
-        error "LocalAI configuration failed"
-        exit 1
-      fi
-      ;;
+    1) setup_local_ollama && backend_setup_success=true ;;
+    2) setup_lm_studio && backend_setup_success=true ;;
+    3) setup_ollama_container && backend_setup_success=true ;;
+    4) setup_llama_cpp && backend_setup_success=true ;;
+    5) setup_localai && backend_setup_success=true ;;
   esac
   
-  # Start OpenWebUI
-  start_open_webui
+  if ! $backend_setup_success; then
+    error "Backend configuration failed"
+    exit 1
+  fi
   
-  # Verify connectivity
+  # Launch UI container
+  if ! start_open_webui; then
+    exit 1
+  fi
+  
+  # Test backend connectivity
   verify_connectivity
   
-  # Show access information
+  # Display access information
   show_access_info
+  
+  exit 0
 }
 
-# Program execution
+# Call main with all arguments
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   main "$@"
 fi
