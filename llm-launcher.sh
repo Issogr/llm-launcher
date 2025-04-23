@@ -12,7 +12,11 @@
 
 # Enable better error detection and handling
 set -o pipefail
-trap cleanup EXIT
+
+# List of started containers for cleanup
+STARTED_CONTAINERS=""
+DEBUG=${DEBUG:-false}
+VERBOSE=${VERBOSE:-false}
 
 # Base paths for configuration and data
 LLM_BASE_DIR="${HOME}/llm"
@@ -31,12 +35,30 @@ error() { echo -e "${RED}ERROR: $1${NC}" >&2; echo; }
 success() { echo -e "${GREEN}SUCCESS: $1${NC}"; echo; }
 warning() { echo -e "${YELLOW}WARNING: $1${NC}"; echo; }
 info() { echo -e "${BLUE}INFO: $1${NC}"; }
+debug() { [[ "$DEBUG" == "true" ]] && echo -e "${CYAN}DEBUG: $1${NC}"; }
 
-# Executed when script exits for any reason
+# Improved signal handling and cleanup
 cleanup() {
-  # Can be extended with container cleanup if needed
+  info "Cleaning up..."
+  
+  # Stop containers in reverse order of starting
+  if [[ -n "$STARTED_CONTAINERS" ]]; then
+    local containers=(${STARTED_CONTAINERS})
+    for ((i=${#containers[@]}-1; i>=0; i--)); do
+      local container="${containers[$i]}"
+      info "Stopping container $container..."
+      docker stop "$container" &>/dev/null
+    done
+  fi
+  
+  # Additional cleanup tasks can be added here
+  info "Cleanup completed"
+  
   return 0
 }
+
+# Setup trap for common signals
+trap 'echo -e "\n${YELLOW}Received interrupt signal. Cleaning up...${NC}"; cleanup; exit 1;' SIGINT SIGTERM SIGHUP
 
 # Prompt user with timeout to prevent script hanging indefinitely
 prompt_with_timeout() {
@@ -56,6 +78,147 @@ prompt_with_timeout() {
   return $?
 }
 
+# Check if script is run as root
+check_root() {
+  if [[ $EUID -eq 0 ]]; then
+    warning "Running this script as root is not recommended"
+    warning "Docker should be configured to run without sudo"
+    if ! prompt_with_timeout "${YELLOW}Continue anyway? (y/n):${NC}" 10 "n"; then
+      exit 1
+    fi
+  fi
+}
+
+# Check Docker permissions
+check_docker_permissions() {
+  debug "Checking Docker permissions..."
+  
+  # First check if docker command exists
+  if ! command -v docker &> /dev/null; then
+    error "Docker is not installed. Please install it before continuing."
+    return 1
+  fi
+  
+  # Check if user can run docker without sudo
+  if ! docker info &>/dev/null; then
+    warning "Cannot run Docker commands. Checking if sudo access is available..."
+    
+    # Try with sudo if available
+    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+      if sudo docker info &>/dev/null; then
+        warning "Docker requires sudo privileges. It's recommended to add your user to the docker group:"
+        warning "    sudo usermod -aG docker $USER && newgrp docker"
+        if ! prompt_with_timeout "${YELLOW}Continue using sudo for Docker commands? (y/n):${NC}" 10 "n"; then
+          return 1
+        fi
+        info "Will use sudo for Docker commands"
+        # Create function to prepend sudo to docker commands
+        function docker() {
+          sudo docker "$@"
+        }
+        export -f docker
+      else
+        error "Cannot run Docker even with sudo. Please check your Docker installation."
+        return 1
+      fi
+    else
+      error "Cannot run Docker commands and sudo is not available."
+      error "Please ensure Docker is properly installed and your user has proper permissions."
+      return 1
+    fi
+  fi
+  
+  return 0
+}
+
+# Hardware detection and automatic resource allocation
+detect_hardware() {
+  info "Detecting hardware capabilities..."
+  
+  # Detect total memory
+  local TOTAL_MEM=$(free -g | awk '/^Mem:/{print $2}')
+  if [[ $TOTAL_MEM -lt 8 ]]; then
+    warning "Low memory detected: ${TOTAL_MEM}G. This may impact performance."
+    RECOMMENDED_MEM="${TOTAL_MEM}G"
+    RECOMMENDED_SHM="$((TOTAL_MEM / 2))g"
+  else
+    RECOMMENDED_MEM="$((TOTAL_MEM * 80 / 100))G"  # 80% of available memory
+    RECOMMENDED_SHM="$((TOTAL_MEM * 50 / 100))g"  # 50% of available memory
+  fi
+  
+  # Detect CPU cores
+  local CPU_CORES=$(nproc --all)
+  RECOMMENDED_THREADS=$((CPU_CORES > 4 ? CPU_CORES - 2 : CPU_CORES))
+  
+  # Detect GPU type
+  if command -v lspci &>/dev/null; then
+    local GPU_INFO=$(lspci | grep -i 'vga\|3d\|display')
+    if [[ $GPU_INFO =~ [Nn][Vv][Ii][Dd][Ii][Aa] ]]; then
+      GPU_TYPE="NVIDIA"
+      GPU_PARAMS="--gpus all"
+      debug "NVIDIA GPU detected"
+    elif [[ $GPU_INFO =~ [Aa][Mm][Dd] ]]; then
+      GPU_TYPE="AMD"
+      GPU_PARAMS="--device=/dev/dri"
+      debug "AMD GPU detected"
+    elif [[ $GPU_INFO =~ [Ii][Nn][Tt][Ee][Ll] ]]; then
+      GPU_TYPE="INTEL"
+      GPU_PARAMS="--device=/dev/dri"
+      debug "Intel GPU detected"
+    else
+      GPU_TYPE="NONE"
+      GPU_PARAMS=""
+      debug "No supported GPU detected"
+    fi
+  else
+    GPU_TYPE="UNKNOWN"
+    GPU_PARAMS="--device=/dev/dri"
+    debug "Cannot detect GPU (lspci not available)"
+  fi
+  
+  # Print hardware summary
+  info "System resources detected:"
+  info "  - Memory: ${TOTAL_MEM}G (Recommended: ${RECOMMENDED_MEM})"
+  info "  - CPU Cores: ${CPU_CORES} (Recommended threads: ${RECOMMENDED_THREADS})"
+  info "  - GPU Type: ${GPU_TYPE}"
+  
+  # Update config values if they exist
+  if [ -f "${CONFIG_FILE}" ]; then
+    source "${CONFIG_FILE}"
+    # Only suggest changes if values are significantly different
+    if [[ ${MEMORY_LIMIT%[A-Za-z]} -lt ${RECOMMENDED_MEM%[A-Za-z]} ]]; then
+      if prompt_with_timeout "${YELLOW}Current memory limit (${MEMORY_LIMIT}) is less than recommended (${RECOMMENDED_MEM}). Update? (y/n):${NC}" 10 "n"; then
+        sed -i "s/^MEMORY_LIMIT=.*/MEMORY_LIMIT=\"${RECOMMENDED_MEM}\"/" "${CONFIG_FILE}"
+        MEMORY_LIMIT="${RECOMMENDED_MEM}"
+      fi
+    fi
+    if [[ ${SHM_SIZE%[A-Za-z]} -lt ${RECOMMENDED_SHM%[A-Za-z]} ]]; then
+      if prompt_with_timeout "${YELLOW}Current shared memory (${SHM_SIZE}) is less than recommended (${RECOMMENDED_SHM}). Update? (y/n):${NC}" 10 "n"; then
+        sed -i "s/^SHM_SIZE=.*/SHM_SIZE=\"${RECOMMENDED_SHM}\"/" "${CONFIG_FILE}"
+        SHM_SIZE="${RECOMMENDED_SHM}"
+      fi
+    fi
+    # Update extra flags for LocalAI
+    if [[ "${LOCALAI_EXTRA_FLAGS}" != *"--threads ${RECOMMENDED_THREADS}"* ]]; then
+      if prompt_with_timeout "${YELLOW}Update LocalAI thread count to ${RECOMMENDED_THREADS}? (y/n):${NC}" 10 "n"; then
+        sed -i "s/^LOCALAI_EXTRA_FLAGS=.*/LOCALAI_EXTRA_FLAGS=\"--threads ${RECOMMENDED_THREADS}\"/" "${CONFIG_FILE}"
+        LOCALAI_EXTRA_FLAGS="--threads ${RECOMMENDED_THREADS}"
+      fi
+    fi
+  fi
+}
+
+# Check service system (systemd or other)
+get_service_manager() {
+  if command -v systemctl &>/dev/null; then
+    echo "systemd"
+  elif command -v service &>/dev/null; then
+    echo "sysvinit"
+  else
+    echo "none"
+  fi
+}
+
 # Display usage instructions and available options
 show_help() {
   echo -e "${CYAN}========== LLM Launcher Help ==========${NC}"
@@ -70,6 +233,9 @@ show_help() {
   echo "  --stop                    Stop running containers and services started by this script"
   echo "  --non-interactive         Run with default options (must specify backend with --backend)"
   echo "  --backend=TYPE            Specify backend type: ollama, lmstudio, ollama-container, llama-cpp, localai"
+  echo "  --verbose                 Enable verbose output"
+  echo "  --debug                   Enable debug output"
+  echo "  --detect-hardware         Detect hardware and suggest settings"
   echo
   echo "Standard usage:"
   echo "  ./llm-launcher.sh          Launch normally using existing configurations"
@@ -134,6 +300,13 @@ create_default_config() {
   
   info "Creating the default configuration file..."
   
+  # Detect hardware for better defaults
+  local DETECTED_MEM=$(free -g | awk '/^Mem:/{print $2}')
+  local MEM_LIMIT="$((DETECTED_MEM * 80 / 100))G"  # 80% of available memory
+  local SHARE_MEM="$((DETECTED_MEM / 2))g"  # 50% of available memory
+  local CPU_CORES=$(nproc --all)
+  local THREADS=$((CPU_CORES > 4 ? CPU_CORES - 2 : CPU_CORES))
+  
   cat > "${CONFIG_FILE}" << EOF
 # Configuration for llm-launcher.sh
 # Modify these parameters according to your needs
@@ -164,11 +337,11 @@ LOCALAI_IMAGE="localai/localai:v2.27.0-sycl-f16-ffmpeg"
 LOCALAI_NAME="localai-container"
 LOCALAI_PORT="8080"
 LOCALAI_MODEL="gemma-3-4b-it-qat"
-LOCALAI_EXTRA_FLAGS="--threads 4"
+LOCALAI_EXTRA_FLAGS="--threads ${THREADS}"
 
-# Memory requirements (in gigabytes)
-MEMORY_LIMIT="30G"
-SHM_SIZE="20g"
+# Memory requirements (detected from system)
+MEMORY_LIMIT="${MEM_LIMIT}"
+SHM_SIZE="${SHARE_MEM}"
 
 # Network diagnostics
 NETWORK_DIAGNOSTIC_TIMEOUT="2" # seconds for timeout in connectivity tests
@@ -206,15 +379,8 @@ edit_config() {
 check_prerequisites() {
   info "Checking prerequisites..."
   
-  # Check if docker is installed
-  if ! command -v docker &> /dev/null; then
-    error "Docker is not installed. Install it before running this script."
-    return 1
-  fi
-  
-  # Check if docker is running
-  if ! docker info &> /dev/null; then
-    error "Docker service is not running. Start it with 'sudo systemctl start docker'."
+  # Verify docker permissions 
+  if ! check_docker_permissions; then
     return 1
   fi
   
@@ -246,6 +412,36 @@ check_prerequisites() {
   
   success "Prerequisites verified"
   return 0
+}
+
+# Improved container start function to reduce code duplication
+start_container() {
+  local name="$1"
+  local image="$2"
+  local port_mapping="$3"
+  local cmd="$4"
+  shift 4
+  
+  info "Starting container $name..."
+  debug "Image: $image"
+  debug "Port mapping: $port_mapping"
+  debug "Extra params: $*"
+  
+  if docker run -d \
+    $port_mapping \
+    --name="$name" \
+    --network="$DOCKER_NETWORK" \
+    "$@" \
+    "$image" \
+    $cmd; then
+    
+    STARTED_CONTAINERS="$STARTED_CONTAINERS $name"
+    success "Container '$name' started successfully"
+    return 0
+  else
+    error "Failed to start container '$name'"
+    return 1
+  fi
 }
 
 # Pull latest Docker image or use existing local image if download fails
@@ -405,16 +601,50 @@ setup_local_ollama() {
       if prompt_with_timeout "${YELLOW}Try starting Ollama service? (y/n):${NC}" 10; then
         info "Attempting to start Ollama service..."
         
-        # Simplified service startup logic
-        if systemctl --version &>/dev/null && systemctl list-unit-files | grep -q ollama; then
-          sudo systemctl start ollama
-        else
-          mkdir -p ${LLM_BASE_DIR}/logs
-          nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
-        fi
+        # Check service manager and start accordingly
+        local service_manager=$(get_service_manager)
+        debug "Service manager detected: $service_manager"
         
-        info "Waiting for Ollama to start (5 seconds)..."
-        sleep 5
+        case "$service_manager" in
+          "systemd")
+            if systemctl list-unit-files | grep -q ollama; then
+              sudo systemctl start ollama
+              info "Started Ollama via systemd"
+            else
+              mkdir -p ${LLM_BASE_DIR}/logs
+              nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
+              info "Started Ollama manually (not found in systemd)"
+            fi
+            ;;
+          "sysvinit")
+            if service --status-all 2>&1 | grep -q ollama; then
+              sudo service ollama start
+              info "Started Ollama via service"
+            else
+              mkdir -p ${LLM_BASE_DIR}/logs
+              nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
+              info "Started Ollama manually (not found in service)"
+            fi
+            ;;
+          *)
+            mkdir -p ${LLM_BASE_DIR}/logs
+            nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
+            info "Started Ollama manually"
+            ;;
+        esac
+        
+        # Dynamic waiting for Ollama to start
+        info "Waiting for Ollama to start..."
+        for ((i=1; i<=30; i++)); do
+          if curl -s --connect-timeout 1 http://localhost:11434/api/version > /dev/null; then
+            success "Ollama started in $i seconds"
+            break
+          fi
+          if ((i == 30)); then
+            warning "Timeout while waiting for Ollama"
+          fi
+          sleep 1
+        done
         
         if ! curl -s --connect-timeout 2 http://localhost:11434/api/version > /dev/null; then
           warning "Unable to start Ollama. Verify the installation."
@@ -504,27 +734,35 @@ setup_ollama_container() {
     return 1
   fi
   
-  # Start the Ollama container with simplified command
-  info "Starting container $OLLAMA_CONTAINER_NAME..."
-  if ! docker run -itd \
-    -p $OLLAMA_CONTAINER_PORT:11434 \
-    --device=/dev/dri \
-    -v "${LLM_BASE_DIR}/models/ollama:/root/.ollama/models" \
-    -e OLLAMA_HOST=0.0.0.0 \
-    --memory="${MEMORY_LIMIT}" \
-    --name=$OLLAMA_CONTAINER_NAME \
-    --shm-size="${SHM_SIZE}" \
-    --network=$DOCKER_NETWORK \
-    $OLLAMA_CONTAINER_IMAGE \
-    bash -c 'ln -s /llm/ollama/ollama /usr/local/bin/ollama && cd /llm/scripts && source ipex-llm-init --gpu --device iGPU && bash start-ollama.sh && tail -f /dev/null'; then
-    
-    error "Unable to start container $OLLAMA_CONTAINER_NAME"
+  # Start the Ollama container using the common function
+  if ! start_container "$OLLAMA_CONTAINER_NAME" \
+    "$OLLAMA_CONTAINER_IMAGE" \
+    "-p $OLLAMA_CONTAINER_PORT:11434" \
+    "bash -c 'ln -s /llm/ollama/ollama /usr/local/bin/ollama && cd /llm/scripts && source ipex-llm-init --gpu --device iGPU && bash start-ollama.sh && tail -f /dev/null'" \
+    $GPU_PARAMS \
+    "-v ${LLM_BASE_DIR}/models/ollama:/root/.ollama/models" \
+    "-e OLLAMA_HOST=0.0.0.0" \
+    "--memory=${MEMORY_LIMIT}" \
+    "--shm-size=${SHM_SIZE}"; then
     return 1
   fi
   
-  # Wait for Ollama to start
-  info "Waiting for Ollama to start in the container (15 seconds)..."
-  sleep 15
+  # Wait for Ollama to start with dynamic checking
+  info "Waiting for Ollama to start in the container..."
+  local api_ready=false
+  for ((i=1; i<=30; i++)); do
+    if docker exec $OLLAMA_CONTAINER_NAME curl -s --connect-timeout 1 http://localhost:11434/api/version > /dev/null; then
+      api_ready=true
+      success "Ollama API is ready after $i seconds"
+      break
+    fi
+    sleep 1
+  done
+  
+  if ! $api_ready; then
+    warning "Ollama API is not responding after 30 seconds"
+    warning "Continuing anyway, but there might be issues"
+  fi
   
   # Configure environment variables for OpenWebUI
   OLLAMA_HOST_VAR=$OLLAMA_CONTAINER_NAME
@@ -601,28 +839,36 @@ setup_localai() {
   # Create models directory
   mkdir -p "${LLM_BASE_DIR}/models/localai"
   
-  # Start the LocalAI container with simplified command
-  info "Starting container $LOCALAI_NAME with model $LOCALAI_MODEL..."
-  if ! docker run -itd \
-    -p ${LOCALAI_PORT}:8080 \
-    --device=/dev/dri \
-    -v "${LLM_BASE_DIR}/models/localai:/build/models" \
-    -e DEBUG=true \
-    -e MODELS_PATH=/build/models \
-    -e THREADS=1 \
-    --name=$LOCALAI_NAME \
-    --shm-size="${SHM_SIZE}" \
-    --network=$DOCKER_NETWORK \
-    $LOCALAI_IMAGE \
-    $LOCALAI_MODEL $LOCALAI_EXTRA_FLAGS; then
-    
-    error "Unable to start container $LOCALAI_NAME"
+  # Start the LocalAI container using the common function
+  if ! start_container "$LOCALAI_NAME" \
+    "$LOCALAI_IMAGE" \
+    "-p ${LOCALAI_PORT}:8080" \
+    "$LOCALAI_MODEL $LOCALAI_EXTRA_FLAGS" \
+    $GPU_PARAMS \
+    "-v ${LLM_BASE_DIR}/models/localai:/build/models" \
+    "-e DEBUG=true" \
+    "-e MODELS_PATH=/build/models" \
+    "-e THREADS=1" \
+    "--shm-size=${SHM_SIZE}"; then
     return 1
   fi
   
-  # Wait for LocalAI to start
-  info "Waiting for LocalAI to start in the container (15 seconds)..."
-  sleep 15
+  # Wait for LocalAI to start with dynamic checking
+  info "Waiting for LocalAI to start in the container..."
+  local api_ready=false
+  for ((i=1; i<=30; i++)); do
+    if curl -s --connect-timeout 1 "http://localhost:${LOCALAI_PORT}/v1/models" > /dev/null; then
+      api_ready=true
+      success "LocalAI API is ready after $i seconds"
+      break
+    fi
+    sleep 1
+  done
+  
+  if ! $api_ready; then
+    warning "LocalAI API is not responding after 30 seconds"
+    warning "Continuing anyway, but there might be issues"
+  fi
   
   # Configure environment variables for OpenWebUI
   OPENAI_API_KEY="localai"
@@ -659,15 +905,9 @@ start_open_webui() {
     return 1
   fi
   
-  info "Starting container $OPEN_WEBUI_NAME..."
-  
-  # Use array for Docker run command (cleaner than string concatenation)
+  # Prepare container parameters
   local docker_args=(
-    "run" "-d"
-    "-p" "${OPEN_WEBUI_PORT}:8080"
-    "-v" "${LLM_BASE_DIR}/data/open-webui:/app/backend/data"
-    "--name" "$OPEN_WEBUI_NAME"
-    "--network=$DOCKER_NETWORK"
+    "-v ${LLM_BASE_DIR}/data/open-webui:/app/backend/data"
   )
   
   # Add all environment variables from backend setup
@@ -677,16 +917,15 @@ start_open_webui() {
   
   # Add host mapping or other extra parameters if needed
   if [ -n "$EXTRA_PARAMS" ]; then
-    local extra_args=($EXTRA_PARAMS)
-    docker_args+=("${extra_args[@]}")
+    docker_args+=($EXTRA_PARAMS)
   fi
   
-  # Add the image name as the final parameter
-  docker_args+=("$OPEN_WEBUI_IMAGE")
-  
-  # Launch container
-  if ! docker "${docker_args[@]}"; then
-    error "Unable to start container $OPEN_WEBUI_NAME"
+  # Start OpenWebUI container using the common function
+  if ! start_container "$OPEN_WEBUI_NAME" \
+    "$OPEN_WEBUI_IMAGE" \
+    "-p ${OPEN_WEBUI_PORT}:8080" \
+    "" \
+    "${docker_args[@]}"; then
     return 1
   fi
   
@@ -698,37 +937,43 @@ start_open_webui() {
 verify_connectivity() {
   info "Verifying connectivity between OpenWebUI and the backend..."
   
-  # Allow container time to initialize networking
-  sleep 5
+  # Dynamic checking for backend readiness
+  local api_ready=false
+  for ((i=1; i<=10; i++)); do
+    # Determine appropriate API endpoint to test based on backend type
+    local test_url=""
+    local test_container=$OPEN_WEBUI_NAME
+    
+    case "$BACKEND_TYPE" in
+      "ollama")
+        test_url="$OLLAMA_URL_VAR/api/version"
+        ;;
+      "ollama-container")
+        test_url="$BACKEND_URL"
+        ;;
+      "lmstudio"|"llama-cpp")
+        test_url="$BACKEND_URL"
+        ;;
+      "localai")
+        test_url="${OPENAI_API_BASE_URL}/models"
+        ;;
+    esac
+    
+    if docker exec $test_container curl -s --connect-timeout 2 "$test_url" > /dev/null; then
+      api_ready=true
+      success "OpenWebUI can connect to the $BACKEND_TYPE backend"
+      break
+    fi
+    sleep 1
+  done
   
-  # Determine appropriate API endpoint to test based on backend type
-  local test_url=""
-  local test_container=$OPEN_WEBUI_NAME
-  
-  case "$BACKEND_TYPE" in
-    "ollama")
-      test_url="$OLLAMA_URL_VAR/api/version"
-      ;;
-    "ollama-container")
-      test_url="$BACKEND_URL"
-      ;;
-    "lmstudio"|"llama-cpp")
-      test_url="$BACKEND_URL"
-      ;;
-    "localai")
-      test_url="${OPENAI_API_BASE_URL}/models"
-      ;;
-  esac
-  
-  # Test API connectivity with timeout to prevent hanging
-  if docker exec $test_container timeout 5 curl -s "$test_url" > /dev/null; then
-    success "OpenWebUI can connect to the $BACKEND_TYPE backend"
-    return 0
-  else
+  if ! $api_ready; then
     warning "OpenWebUI cannot connect to the $BACKEND_TYPE backend"
     warning "Check network settings and ensure the backend is running"
     return 1
   fi
+  
+  return 0
 }
 
 # Function to display access information
@@ -789,8 +1034,26 @@ stop_services() {
   fi
   
   # 4. Check local Ollama started by the script
-  if pgrep -f "ollama serve" &>/dev/null && [[ -f "${LLM_BASE_DIR}/logs/ollama.log" ]]; then
-    active_services+=("Local Ollama")
+  # Use multiple methods to detect Ollama, not just systemd
+  local service_manager=$(get_service_manager)
+  case "$service_manager" in
+    "systemd")
+      if systemctl is-active ollama &>/dev/null; then
+        active_services+=("Local Ollama (systemd)")
+        any_services_found=true
+      fi
+      ;;
+    "sysvinit")
+      if service ollama status &>/dev/null; then
+        active_services+=("Local Ollama (service)")
+        any_services_found=true
+      fi
+      ;;
+  esac
+  
+  # Check for manually started Ollama process
+  if pgrep -f "ollama serve" &>/dev/null; then
+    active_services+=("Local Ollama (process)")
     any_services_found=true
   fi
   
@@ -836,20 +1099,33 @@ stop_services() {
         fi
         ;;
       
-      "Local Ollama")
-        info "Stopping local Ollama..."
-        if systemctl stop ollama &>/dev/null; then
+      "Local Ollama (systemd)")
+        info "Stopping local Ollama via systemd..."
+        if sudo systemctl stop ollama &>/dev/null; then
           ((stopped_count++))
           success "Local Ollama service stopped"
         else
-          # Fallback to process kill if systemctl fails
-          warning "Unable to stop Ollama service with systemctl, trying direct process kill..."
-          if pkill -f "ollama serve"; then
-            ((stopped_count++))
-            success "Local Ollama stopped via process kill"
-          else
-            warning "Unable to stop local Ollama"
-          fi
+          warning "Unable to stop local Ollama service"
+        fi
+        ;;
+      
+      "Local Ollama (service)")
+        info "Stopping local Ollama via service..."
+        if sudo service ollama stop &>/dev/null; then
+          ((stopped_count++))
+          success "Local Ollama service stopped"
+        else
+          warning "Unable to stop local Ollama service"
+        fi
+        ;;
+      
+      "Local Ollama (process)")
+        info "Stopping local Ollama process..."
+        if pkill -f "ollama serve"; then
+          ((stopped_count++))
+          success "Local Ollama process stopped"
+        else
+          warning "Unable to stop local Ollama process"
         fi
         ;;
     esac
@@ -868,6 +1144,9 @@ main() {
   # Command-line flags
   local non_interactive=false
   local backend_choice=""
+  
+  # Check if running as root at the very beginning
+  check_root
   
   # Process command-line arguments first
   while [[ $# -gt 0 ]]; do
@@ -914,6 +1193,23 @@ main() {
         stop_services
         exit $?
         ;;
+      --verbose)
+        VERBOSE=true
+        ;;
+      --debug)
+        DEBUG=true
+        VERBOSE=true
+        ;;
+      --detect-hardware)
+        if [ -f "${CONFIG_FILE}" ]; then
+          source "${CONFIG_FILE}"
+        else
+          warning "Configuration file not found. Creating default..."
+          create_default_config
+        fi
+        detect_hardware
+        exit 0
+        ;;
       *)
         error "Unrecognized option: $1"
         show_help
@@ -933,6 +1229,11 @@ main() {
   # Verify environment and configuration
   if ! check_prerequisites; then
     exit 1
+  fi
+  
+  # Detect hardware if configuration exists
+  if [ -f "${CONFIG_FILE}" ]; then
+    detect_hardware
   fi
   
   # Ensure Docker network exists
