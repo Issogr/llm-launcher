@@ -414,6 +414,194 @@ check_prerequisites() {
   return 0
 }
 
+# Generic connectivity check function
+check_endpoint_connectivity() {
+  local endpoint="$1"
+  local friendly_name="$2"
+  local timeout="${3:-3}"
+  local continue_on_failure="${4:-false}"
+  
+  info "Checking connection to $friendly_name..."
+  
+  if ! curl -s --connect-timeout $timeout "$endpoint" > /dev/null; then
+    warning "Cannot connect to $friendly_name at $endpoint"
+    warning "Make sure it is running and accessible."
+    
+    if [[ "$continue_on_failure" == "false" ]]; then
+      if ! prompt_with_timeout "${YELLOW}Continue anyway? (y/n):${NC}" 10; then
+        return 1
+      fi
+    fi
+    return 1
+  else
+    success "Connection to $friendly_name verified"
+    return 0
+  fi
+}
+
+# Generic function for container readiness
+wait_for_container_endpoint() {
+  local container_name="$1"
+  local endpoint="$2"
+  local friendly_name="$3"
+  local max_wait="${4:-30}"
+  
+  info "Waiting for $friendly_name to start in the container..."
+  local api_ready=false
+  for ((i=1; i<=$max_wait; i++)); do
+    if docker exec $container_name curl -s --connect-timeout 1 $endpoint > /dev/null; then
+      api_ready=true
+      success "$friendly_name is ready after $i seconds"
+      break
+    fi
+    sleep 1
+  done
+  
+  if ! $api_ready; then
+    warning "$friendly_name is not responding after $max_wait seconds"
+    warning "Continuing anyway, but there might be issues"
+    return 1
+  fi
+  
+  return 0
+}
+
+# Wait for service to start
+wait_for_endpoint_ready() {
+  local url="$1"
+  local friendly_name="$2"
+  local max_wait="${3:-30}"
+  
+  info "Waiting for $friendly_name to start..."
+  local api_ready=false
+  for ((i=1; i<=$max_wait; i++)); do
+    if curl -s --connect-timeout 1 "$url" > /dev/null; then
+      api_ready=true
+      success "$friendly_name is ready after $i seconds"
+      break
+    fi
+    sleep 1
+  done
+  
+  if ! $api_ready; then
+    warning "$friendly_name is not responding after $max_wait seconds"
+    return 1
+  fi
+  
+  return 0
+}
+
+# Configure backend parameters based on type
+configure_backend_params() {
+  local backend_type="$1"
+  
+  # Reset parameters
+  WEBUI_ENV_PARAMS=()
+  EXTRA_PARAMS=""
+  
+  case "$backend_type" in
+    "ollama")
+      OLLAMA_HOST_VAR="host.docker.internal"
+      OLLAMA_URL_VAR="http://host.docker.internal:11434"
+      EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
+      WEBUI_ENV_PARAMS=(
+        "-e OLLAMA_BASE_URL=$OLLAMA_URL_VAR"
+        "-e OLLAMA_API_HOST=$OLLAMA_HOST_VAR"
+        "-e OLLAMA_API_PORT=11434"
+      )
+      BACKEND_URL="http://localhost:11434"
+      ;;
+    
+    "lmstudio")
+      OPENAI_API_KEY="lm-studio"
+      OPENAI_API_HOST=$LM_STUDIO_HOST
+      OPENAI_API_PORT=$LM_STUDIO_PORT
+      OPENAI_API_BASE_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1"
+      WEBUI_ENV_PARAMS=(
+        "-e OPENAI_API_KEY=$OPENAI_API_KEY"
+        "-e OPENAI_API_HOST=$OPENAI_API_HOST"
+        "-e OPENAI_API_PORT=$OPENAI_API_PORT"
+        "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
+      )
+      BACKEND_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models"
+      ;;
+    
+    "ollama-container")
+      OLLAMA_HOST_VAR=$OLLAMA_CONTAINER_NAME
+      OLLAMA_URL_VAR="http://$OLLAMA_CONTAINER_NAME:11434"
+      WEBUI_ENV_PARAMS=(
+        "-e OLLAMA_BASE_URL=$OLLAMA_URL_VAR"
+        "-e OLLAMA_API_HOST=$OLLAMA_HOST_VAR"
+        "-e OLLAMA_API_PORT=11434"
+      )
+      BACKEND_URL="$OLLAMA_URL_VAR/api/version"
+      ;;
+    
+    "llama-cpp")
+      OPENAI_API_KEY="llama-cpp"
+      OPENAI_API_HOST="host.docker.internal"
+      OPENAI_API_PORT=$LLAMA_CPP_PORT
+      OPENAI_API_BASE_URL="http://host.docker.internal:$LLAMA_CPP_PORT/v1"
+      EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
+      WEBUI_ENV_PARAMS=(
+        "-e OPENAI_API_KEY=$OPENAI_API_KEY"
+        "-e OPENAI_API_HOST=$OPENAI_API_HOST"
+        "-e OPENAI_API_PORT=$OPENAI_API_PORT"
+        "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
+      )
+      BACKEND_URL="http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/models"
+      ;;
+    
+    "localai")
+      OPENAI_API_KEY="localai"
+      OPENAI_API_BASE_URL="http://$LOCALAI_NAME:8080/v1"
+      WEBUI_ENV_PARAMS=(
+        "-e OPENAI_API_KEY=$OPENAI_API_KEY"
+        "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
+      )
+      BACKEND_URL="http://localhost:${LOCALAI_PORT}/v1/models"
+      ;;
+  esac
+  
+  BACKEND_TYPE="$backend_type"
+  return 0
+}
+
+# Generalized service management
+manage_service() {
+  local service_name="$1"
+  local action="$2"  # start/stop/status
+  
+  local service_manager=$(get_service_manager)
+  
+  case "$service_manager" in
+    "systemd")
+      if systemctl list-unit-files | grep -q $service_name; then
+        sudo systemctl $action $service_name
+        return $?
+      fi
+      ;;
+    "sysvinit")
+      if service --status-all 2>&1 | grep -q $service_name; then
+        sudo service $service_name $action
+        return $?
+      fi
+      ;;
+  esac
+  
+  # Fallback for manual service management
+  if [[ "$action" == "start" ]]; then
+    mkdir -p ${LLM_BASE_DIR}/logs
+    nohup $service_name serve > ${LLM_BASE_DIR}/logs/$service_name.log 2>&1 &
+    return $?
+  elif [[ "$action" == "stop" ]]; then
+    pkill -f "$service_name serve"
+    return $?
+  fi
+  
+  return 1
+}
+
 # Improved container start function to reduce code duplication
 start_container() {
   local name="$1"
@@ -427,14 +615,23 @@ start_container() {
   debug "Port mapping: $port_mapping"
   debug "Extra params: $*"
   
-  if docker run -d \
-    $port_mapping \
-    --name="$name" \
-    --network="$DOCKER_NETWORK" \
-    "$@" \
-    "$image" \
-    $cmd; then
-    
+  # Build docker run command explicitly to avoid space issues
+  local docker_cmd="docker run -d ${port_mapping} --name=${name} --network=${DOCKER_NETWORK}"
+  
+  # Add all additional parameters without any space issues
+  for param in "$@"; do
+    docker_cmd="${docker_cmd} ${param}"
+  done
+  
+  # Add image and command
+  docker_cmd="${docker_cmd} ${image}"
+  if [ -n "$cmd" ]; then
+    docker_cmd="${docker_cmd} ${cmd}"
+  fi
+  
+  debug "Full docker command: $docker_cmd"
+  
+  if eval ${docker_cmd}; then
     STARTED_CONTAINERS="$STARTED_CONTAINERS $name"
     success "Container '$name' started successfully"
     return 0
@@ -460,8 +657,8 @@ update_docker_image() {
     info "$friendly_name image not found locally"
   fi
   
-  # Try to download latest version with 30s timeout
-  if timeout 30s docker pull "$image_name"; then
+  # Try to download latest version (no timeout)
+  if docker pull "$image_name"; then
     success "$friendly_name image updated/downloaded successfully"
     return 0
   fi
@@ -496,6 +693,23 @@ create_docker_network() {
     fi
   else
     info "Docker network '$DOCKER_NETWORK' already exists"
+  fi
+  
+  return 0
+}
+
+# Function to check and remove existing containers
+remove_container_if_exists() {
+  local container_name="$1"
+  
+  if [ "$(docker ps -aq -f name=^/${container_name}$)" ]; then
+    info "Removing existing '$container_name' container..."
+    if docker rm -f $container_name &>/dev/null; then
+      success "Container '$container_name' removed"
+    else
+      error "Unable to remove container '$container_name'"
+      return 1
+    fi
   fi
   
   return 0
@@ -564,23 +778,6 @@ check_network_status() {
   return 0
 }
 
-# Function to check and remove existing containers
-remove_container_if_exists() {
-  local container_name="$1"
-  
-  if [ "$(docker ps -aq -f name=^/${container_name}$)" ]; then
-    info "Removing existing '$container_name' container..."
-    if docker rm -f $container_name &>/dev/null; then
-      success "Container '$container_name' removed"
-    else
-      error "Unable to remove container '$container_name'"
-      return 1
-    fi
-  fi
-  
-  return 0
-}
-
 # Function to configure and launch local Ollama (option 1)
 setup_local_ollama() {
   info "Configuring Ollama on the local host..."
@@ -601,54 +798,16 @@ setup_local_ollama() {
       if prompt_with_timeout "${YELLOW}Try starting Ollama service? (y/n):${NC}" 10; then
         info "Attempting to start Ollama service..."
         
-        # Check service manager and start accordingly
-        local service_manager=$(get_service_manager)
-        debug "Service manager detected: $service_manager"
+        # Use the generic service management function
+        if manage_service "ollama" "start"; then
+          info "Ollama service started"
+        else
+          info "Started Ollama manually"
+        fi
         
-        case "$service_manager" in
-          "systemd")
-            if systemctl list-unit-files | grep -q ollama; then
-              sudo systemctl start ollama
-              info "Started Ollama via systemd"
-            else
-              mkdir -p ${LLM_BASE_DIR}/logs
-              nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
-              info "Started Ollama manually (not found in systemd)"
-            fi
-            ;;
-          "sysvinit")
-            if service --status-all 2>&1 | grep -q ollama; then
-              sudo service ollama start
-              info "Started Ollama via service"
-            else
-              mkdir -p ${LLM_BASE_DIR}/logs
-              nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
-              info "Started Ollama manually (not found in service)"
-            fi
-            ;;
-          *)
-            mkdir -p ${LLM_BASE_DIR}/logs
-            nohup ollama serve > ${LLM_BASE_DIR}/logs/ollama.log 2>&1 &
-            info "Started Ollama manually"
-            ;;
-        esac
-        
-        # Dynamic waiting for Ollama to start
-        info "Waiting for Ollama to start..."
-        for ((i=1; i<=30; i++)); do
-          if curl -s --connect-timeout 1 http://localhost:11434/api/version > /dev/null; then
-            success "Ollama started in $i seconds"
-            break
-          fi
-          if ((i == 30)); then
-            warning "Timeout while waiting for Ollama"
-          fi
-          sleep 1
-        done
-        
-        if ! curl -s --connect-timeout 2 http://localhost:11434/api/version > /dev/null; then
+        # Use the generic wait for endpoint function
+        if ! wait_for_endpoint_ready "http://localhost:11434/api/version" "Ollama"; then
           warning "Unable to start Ollama. Verify the installation."
-          
           if ! prompt_with_timeout "${YELLOW}Continue without active Ollama? (y/n):${NC}" 10; then
             return 1
           fi
@@ -663,21 +822,8 @@ setup_local_ollama() {
     success "Connection to Ollama on host verified"
   fi
   
-  # Configure environment variables for OpenWebUI
-  OLLAMA_HOST_VAR="host.docker.internal"
-  OLLAMA_URL_VAR="http://host.docker.internal:11434"
-  EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
-  
-  # Prepare parameters for OpenWebUI
-  WEBUI_ENV_PARAMS=(
-    "-e OLLAMA_BASE_URL=$OLLAMA_URL_VAR"
-    "-e OLLAMA_API_HOST=$OLLAMA_HOST_VAR"
-    "-e OLLAMA_API_PORT=11434"
-  )
-  
-  # Save the backend type for final verification
-  BACKEND_TYPE="ollama"
-  BACKEND_URL="http://localhost:11434"
+  # Use the generic backend configuration function
+  configure_backend_params "ollama"
   
   return 0
 }
@@ -686,36 +832,11 @@ setup_local_ollama() {
 setup_lm_studio() {
   info "Configuring to use LM Studio on another PC ($LM_STUDIO_HOST:$LM_STUDIO_PORT)..."
   
-  # Configuration for LM Studio (OpenAI compatible API)
-  OPENAI_API_KEY="lm-studio"  # Any value works
-  OPENAI_API_HOST=$LM_STUDIO_HOST
-  OPENAI_API_PORT=$LM_STUDIO_PORT
-  OPENAI_API_BASE_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1"
-  EXTRA_PARAMS=""
+  # Use the generic connectivity check
+  check_endpoint_connectivity "http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models" "LM Studio" 3
   
-  # Check connection with timeout
-  if ! curl -s --connect-timeout 3 "http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models" > /dev/null; then
-    warning "Cannot connect to LM Studio on $LM_STUDIO_HOST:$LM_STUDIO_PORT"
-    warning "Make sure it is running and accessible from the network."
-    
-    if ! prompt_with_timeout "${YELLOW}Continue anyway? (y/n):${NC}" 10; then
-      return 1
-    fi
-  else
-    success "Connection to LM Studio on remote PC verified"
-  fi
-  
-  # Prepare parameters for OpenWebUI
-  WEBUI_ENV_PARAMS=(
-    "-e OPENAI_API_KEY=$OPENAI_API_KEY"
-    "-e OPENAI_API_HOST=$OPENAI_API_HOST"
-    "-e OPENAI_API_PORT=$OPENAI_API_PORT"
-    "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
-  )
-  
-  # Save the backend type for final verification
-  BACKEND_TYPE="lmstudio"
-  BACKEND_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models"
+  # Use the generic backend configuration function
+  configure_backend_params "lmstudio"
   
   return 0
 }
@@ -739,7 +860,7 @@ setup_ollama_container() {
     "$OLLAMA_CONTAINER_IMAGE" \
     "-p $OLLAMA_CONTAINER_PORT:11434" \
     "bash -c 'ln -s /llm/ollama/ollama /usr/local/bin/ollama && cd /llm/scripts && source ipex-llm-init --gpu --device iGPU && bash start-ollama.sh && tail -f /dev/null'" \
-    $GPU_PARAMS \
+    "$GPU_PARAMS" \
     "-v ${LLM_BASE_DIR}/models/ollama:/root/.ollama/models" \
     "-e OLLAMA_HOST=0.0.0.0" \
     "--memory=${MEMORY_LIMIT}" \
@@ -747,38 +868,11 @@ setup_ollama_container() {
     return 1
   fi
   
-  # Wait for Ollama to start with dynamic checking
-  info "Waiting for Ollama to start in the container..."
-  local api_ready=false
-  for ((i=1; i<=30; i++)); do
-    if docker exec $OLLAMA_CONTAINER_NAME curl -s --connect-timeout 1 http://localhost:11434/api/version > /dev/null; then
-      api_ready=true
-      success "Ollama API is ready after $i seconds"
-      break
-    fi
-    sleep 1
-  done
+  # Use the generic wait for container function
+  wait_for_container_endpoint "$OLLAMA_CONTAINER_NAME" "http://localhost:11434/api/version" "Ollama API"
   
-  if ! $api_ready; then
-    warning "Ollama API is not responding after 30 seconds"
-    warning "Continuing anyway, but there might be issues"
-  fi
-  
-  # Configure environment variables for OpenWebUI
-  OLLAMA_HOST_VAR=$OLLAMA_CONTAINER_NAME
-  OLLAMA_URL_VAR="http://$OLLAMA_CONTAINER_NAME:11434"
-  EXTRA_PARAMS=""
-  
-  # Prepare parameters for OpenWebUI
-  WEBUI_ENV_PARAMS=(
-    "-e OLLAMA_BASE_URL=$OLLAMA_URL_VAR"
-    "-e OLLAMA_API_HOST=$OLLAMA_HOST_VAR"
-    "-e OLLAMA_API_PORT=11434"
-  )
-  
-  # Save the backend type for final verification
-  BACKEND_TYPE="ollama-container"
-  BACKEND_URL="$OLLAMA_URL_VAR/api/version"
+  # Use the generic backend configuration function
+  configure_backend_params "ollama-container"
   
   success "Ollama container started successfully"
   return 0
@@ -788,36 +882,11 @@ setup_ollama_container() {
 setup_llama_cpp() {
   info "Configuring connection to local llama.cpp ($LLAMA_CPP_HOST:$LLAMA_CPP_PORT)..."
   
-  # Configuration for llama.cpp (OpenAI compatible API)
-  OPENAI_API_KEY="llama-cpp"  # Any value works
-  OPENAI_API_HOST="host.docker.internal"
-  OPENAI_API_PORT=$LLAMA_CPP_PORT
-  OPENAI_API_BASE_URL="http://host.docker.internal:$LLAMA_CPP_PORT/v1"
-  EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
+  # Use the generic connectivity check
+  check_endpoint_connectivity "http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/models" "llama.cpp" 3
   
-  # Check connection with timeout
-  if ! curl -s --connect-timeout 3 "http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/models" > /dev/null; then
-    warning "Cannot connect to llama.cpp on $LLAMA_CPP_HOST:$LLAMA_CPP_PORT"
-    warning "Make sure llama.cpp is running with the server enabled"
-    
-    if ! prompt_with_timeout "${YELLOW}Continue anyway? (y/n):${NC}" 10; then
-      return 1
-    fi
-  else
-    success "Connection to llama.cpp on local host verified"
-  fi
-  
-  # Prepare parameters for OpenWebUI
-  WEBUI_ENV_PARAMS=(
-    "-e OPENAI_API_KEY=$OPENAI_API_KEY"
-    "-e OPENAI_API_HOST=$OPENAI_API_HOST"
-    "-e OPENAI_API_PORT=$OPENAI_API_PORT"
-    "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
-  )
-  
-  # Save the backend type for final verification
-  BACKEND_TYPE="llama-cpp"
-  BACKEND_URL="http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/models"
+  # Use the generic backend configuration function
+  configure_backend_params "llama-cpp"
   
   return 0
 }
@@ -844,7 +913,7 @@ setup_localai() {
     "$LOCALAI_IMAGE" \
     "-p ${LOCALAI_PORT}:8080" \
     "$LOCALAI_MODEL $LOCALAI_EXTRA_FLAGS" \
-    $GPU_PARAMS \
+    "$GPU_PARAMS" \
     "-v ${LLM_BASE_DIR}/models/localai:/build/models" \
     "-e DEBUG=true" \
     "-e MODELS_PATH=/build/models" \
@@ -853,39 +922,11 @@ setup_localai() {
     return 1
   fi
   
-  # Wait for LocalAI to start with dynamic checking
-  info "Waiting for LocalAI to start in the container..."
-  local api_ready=false
-  for ((i=1; i<=30; i++)); do
-    if curl -s --connect-timeout 1 "http://localhost:${LOCALAI_PORT}/v1/models" > /dev/null; then
-      api_ready=true
-      success "LocalAI API is ready after $i seconds"
-      break
-    fi
-    sleep 1
-  done
+  # Use the generic wait for endpoint function
+  wait_for_endpoint_ready "http://localhost:${LOCALAI_PORT}/v1/models" "LocalAI API"
   
-  if ! $api_ready; then
-    warning "LocalAI API is not responding after 30 seconds"
-    warning "Continuing anyway, but there might be issues"
-  fi
-  
-  # Configure environment variables for OpenWebUI
-  OPENAI_API_KEY="localai"
-  OPENAI_API_BASE_URL="http://$LOCALAI_NAME:8080/v1"
-  
-  # Prepare parameters for OpenWebUI
-  WEBUI_ENV_PARAMS=(
-    "-e OPENAI_API_KEY=$OPENAI_API_KEY"
-    "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
-  )
-  
-  # Set extra params to empty as we're using Docker networking
-  EXTRA_PARAMS=""
-  
-  # Save the backend type for final verification
-  BACKEND_TYPE="localai"
-  BACKEND_URL="http://localhost:${LOCALAI_PORT}/v1/models"
+  # Use the generic backend configuration function
+  configure_backend_params "localai"
   
   success "LocalAI container started successfully"
   return 0
@@ -937,43 +978,33 @@ start_open_webui() {
 verify_connectivity() {
   info "Verifying connectivity between OpenWebUI and the backend..."
   
-  # Dynamic checking for backend readiness
-  local api_ready=false
-  for ((i=1; i<=10; i++)); do
-    # Determine appropriate API endpoint to test based on backend type
-    local test_url=""
-    local test_container=$OPEN_WEBUI_NAME
-    
-    case "$BACKEND_TYPE" in
-      "ollama")
-        test_url="$OLLAMA_URL_VAR/api/version"
-        ;;
-      "ollama-container")
-        test_url="$BACKEND_URL"
-        ;;
-      "lmstudio"|"llama-cpp")
-        test_url="$BACKEND_URL"
-        ;;
-      "localai")
-        test_url="${OPENAI_API_BASE_URL}/models"
-        ;;
-    esac
-    
-    if docker exec $test_container curl -s --connect-timeout 2 "$test_url" > /dev/null; then
-      api_ready=true
-      success "OpenWebUI can connect to the $BACKEND_TYPE backend"
-      break
-    fi
-    sleep 1
-  done
+  # Determine appropriate API endpoint to test based on backend type
+  local test_url=""
   
-  if ! $api_ready; then
+  case "$BACKEND_TYPE" in
+    "ollama")
+      test_url="$OLLAMA_URL_VAR/api/version"
+      ;;
+    "ollama-container")
+      test_url="$BACKEND_URL"
+      ;;
+    "lmstudio"|"llama-cpp")
+      test_url="$BACKEND_URL"
+      ;;
+    "localai")
+      test_url="${OPENAI_API_BASE_URL}/models"
+      ;;
+  esac
+  
+  # Use docker exec to check from inside the OpenWebUI container
+  if docker exec $OPEN_WEBUI_NAME curl -s --connect-timeout 5 "$test_url" > /dev/null; then
+    success "OpenWebUI can connect to the $BACKEND_TYPE backend"
+    return 0
+  else
     warning "OpenWebUI cannot connect to the $BACKEND_TYPE backend"
     warning "Check network settings and ensure the backend is running"
     return 1
   fi
-  
-  return 0
 }
 
 # Function to display access information
@@ -1099,33 +1130,13 @@ stop_services() {
         fi
         ;;
       
-      "Local Ollama (systemd)")
-        info "Stopping local Ollama via systemd..."
-        if sudo systemctl stop ollama &>/dev/null; then
+      "Local Ollama (systemd)"|"Local Ollama (service)"|"Local Ollama (process)")
+        info "Stopping local Ollama..."
+        if manage_service "ollama" "stop"; then
           ((stopped_count++))
-          success "Local Ollama service stopped"
+          success "Local Ollama stopped"
         else
-          warning "Unable to stop local Ollama service"
-        fi
-        ;;
-      
-      "Local Ollama (service)")
-        info "Stopping local Ollama via service..."
-        if sudo service ollama stop &>/dev/null; then
-          ((stopped_count++))
-          success "Local Ollama service stopped"
-        else
-          warning "Unable to stop local Ollama service"
-        fi
-        ;;
-      
-      "Local Ollama (process)")
-        info "Stopping local Ollama process..."
-        if pkill -f "ollama serve"; then
-          ((stopped_count++))
-          success "Local Ollama process stopped"
-        else
-          warning "Unable to stop local Ollama process"
+          warning "Unable to stop local Ollama"
         fi
         ;;
     esac
