@@ -501,7 +501,6 @@ configure_backend_params() {
       WEBUI_ENV_PARAMS=(
         "-e OLLAMA_BASE_URL=$OLLAMA_URL_VAR"
         "-e OLLAMA_API_HOST=$OLLAMA_HOST_VAR"
-        "-e OLLAMA_API_PORT=11434"
       )
       BACKEND_URL="http://localhost:11434"
       ;;
@@ -522,7 +521,6 @@ configure_backend_params() {
       WEBUI_ENV_PARAMS=(
         "-e OLLAMA_BASE_URL=$OLLAMA_URL_VAR"
         "-e OLLAMA_API_HOST=$OLLAMA_HOST_VAR"
-        "-e OLLAMA_API_PORT=11434"
       )
       BACKEND_URL="$OLLAMA_URL_VAR/api/version"
       ;;
@@ -911,7 +909,24 @@ start_open_webui() {
   # Prepare container parameters
   local docker_args=(
     "-v ${LLM_BASE_DIR}/data/open-webui:/app/backend/data"
+    "-e WEBUI_AUTH=false" # Disable authentication for all backends
   )
+  
+  # Configure backend-specific parameters
+  case "$BACKEND_TYPE" in
+    "ollama"|"ollama-container")
+      # For Ollama backend, enable Ollama API and disable OpenAI
+      docker_args+=("-e ENABLE_OLLAMA_API=true")
+      docker_args+=("-e ENABLE_OPENAI_API=false")
+      docker_args+=("-e ENABLE_DIRECT_CONNECTIONS=false")
+      ;;
+    "lmstudio"|"localai")
+      # For OpenAI-compatible backends, disable Ollama API and enable OpenAI
+      docker_args+=("-e ENABLE_OLLAMA_API=false")
+      docker_args+=("-e ENABLE_OPENAI_API=true")
+      docker_args+=("-e ENABLE_DIRECT_CONNECTIONS=true")
+      ;;
+  esac
   
   # Add all environment variables from backend setup
   for param in "${WEBUI_ENV_PARAMS[@]}"; do
