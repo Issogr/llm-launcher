@@ -16,6 +16,7 @@ set -o pipefail
 STARTED_CONTAINERS=""
 DEBUG=${DEBUG:-false}
 VERBOSE=${VERBOSE:-false}
+INTEL_GPU_DEVICE="iGPU"  # Default to iGPU if not detected otherwise
 
 # Base paths for configuration and data
 LLM_BASE_DIR="${HOME}/llm"
@@ -163,7 +164,24 @@ detect_hardware() {
     elif [[ $GPU_INFO =~ [Ii][Nn][Tt][Ee][Ll] ]]; then
       GPU_TYPE="INTEL"
       GPU_PARAMS="--device=/dev/dri"
-      debug "Intel GPU detected"
+      
+      # Determine specific Intel GPU type
+      INTEL_GPU_DEVICE="iGPU"  # Default to iGPU
+      
+      if [[ $GPU_INFO =~ [Mm][Aa][Xx].[Ss][Ee][Rr][Ii][Ee][Ss] ]]; then
+        INTEL_GPU_DEVICE="Max"
+        debug "Intel Max Series GPU detected"
+      elif [[ $GPU_INFO =~ [Ff][Ll][Ee][Xx].[Ss][Ee][Rr][Ii][Ee][Ss] ]]; then
+        INTEL_GPU_DEVICE="Flex"
+        debug "Intel Flex Series GPU detected"
+      elif [[ $GPU_INFO =~ [Aa][Rr][Cc] ]]; then
+        INTEL_GPU_DEVICE="Arc"
+        debug "Intel Arc GPU detected"
+      else
+        debug "Intel integrated GPU detected, using iGPU as device type"
+      fi
+      
+      debug "Intel GPU detected, DEVICE=${INTEL_GPU_DEVICE}"
     else
       GPU_TYPE="NONE"
       GPU_PARAMS=""
@@ -180,6 +198,9 @@ detect_hardware() {
   info "  - Memory: ${TOTAL_MEM}G (Recommended: ${RECOMMENDED_MEM})"
   info "  - CPU Cores: ${CPU_CORES} (Recommended threads: ${RECOMMENDED_THREADS})"
   info "  - GPU Type: ${GPU_TYPE}"
+  if [[ "$GPU_TYPE" == "INTEL" ]]; then
+    info "  - Intel GPU Device: ${INTEL_GPU_DEVICE}"
+  fi
   
   # Update config values if they exist
   if [ -f "${CONFIG_FILE}" ]; then
@@ -828,14 +849,21 @@ setup_ollama_container() {
     return 1
   fi
   
+  # Set the appropriate GPU device parameter for Intel GPUs
+  local gpu_device_param="iGPU"  # default fallback
+  if [[ "$GPU_TYPE" == "INTEL" && -n "$INTEL_GPU_DEVICE" ]]; then
+    gpu_device_param="$INTEL_GPU_DEVICE"
+  fi
+  
   # Start the Ollama container using the common function
   if ! start_container "$OLLAMA_CONTAINER_NAME" \
     "$OLLAMA_CONTAINER_IMAGE" \
     "-p $OLLAMA_CONTAINER_PORT:11434" \
-    "bash -c 'ln -s /llm/ollama/ollama /usr/local/bin/ollama && cd /llm/scripts && source ipex-llm-init --gpu --device iGPU && bash start-ollama.sh && tail -f /dev/null'" \
+    "bash -c 'cd /llm/scripts && source ipex-llm-init --gpu --device ${gpu_device_param} && bash start-ollama.sh && tail -f /dev/null'" \
     "$GPU_PARAMS" \
     "-v ${LLM_BASE_DIR}/models/ollama:/root/.ollama/models" \
     "-e OLLAMA_HOST=0.0.0.0" \
+    "-e DEVICE=${gpu_device_param}" \
     "--memory=${MEMORY_LIMIT}" \
     "--shm-size=${SHM_SIZE}"; then
     return 1
@@ -911,7 +939,7 @@ start_open_webui() {
     "-v ${LLM_BASE_DIR}/data/open-webui:/app/backend/data"
     "-e WEBUI_AUTH=false" # Disable authentication for all backends
   )
-  
+
   # Configure backend-specific parameters
   case "$BACKEND_TYPE" in
     "ollama"|"ollama-container")
