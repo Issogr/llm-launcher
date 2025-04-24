@@ -1041,56 +1041,129 @@ show_access_info() {
   echo "========================================================"
 }
 
-# Function to stop containers and services that were started
+# Check if a container is running
+is_container_running() {
+  docker inspect --format '{{.State.Running}}' "$1" 2>/dev/null | grep -q "true"
+  return $?
+}
+
+# Stop a container and verify it's actually stopped
+stop_container() {
+  local name="$1"
+  
+  docker stop "$name" &>/dev/null
+  sleep 1 # Brief pause to allow Docker to update container state
+  if ! is_container_running "$name"; then
+    ((stopped_count++))
+    success "$name container stopped"
+    return 0
+  else
+    warning "$name container still appears to be running"
+    return 1
+  fi
+}
+
+# Check if the Ollama service is running and distinguish between local and container
+is_local_ollama_running() {
+  # First check if the Ollama container is running - if it is, then any API
+  # responses are likely coming from the container, not a local installation
+  if is_container_running "$OLLAMA_CONTAINER_NAME"; then
+    debug "Ollama container is running, assuming API responses are from container"
+    return 1
+  fi
+  
+  # Now check if API responds
+  if ! curl -s --connect-timeout 2 http://localhost:11434/api/version &>/dev/null; then
+    debug "Ollama API is not responding"
+    return 1
+  fi
+  
+  # At this point API is responding and container is not running, so it must be local
+  debug "Ollama API is responding and container is not running, so it's the local service"
+  
+  # Double-check with service manager or process
+  local service_manager=$(get_service_manager)
+  if [[ "$service_manager" == "systemd" ]] && systemctl is-active --quiet ollama; then
+    debug "Confirmed local Ollama is running via systemd"
+    return 0
+  elif [[ "$service_manager" == "sysvinit" ]] && service ollama status 2>/dev/null | grep -q "running"; then
+    debug "Confirmed local Ollama is running via service"
+    return 0
+  elif pgrep -x "ollama" &>/dev/null || pgrep -f "ollama serve" &>/dev/null; then
+    debug "Confirmed local Ollama is running as process"
+    return 0
+  fi
+  
+  # If we get here, API is responding but we can't confirm local service
+  debug "API is responding but couldn't confirm local service, assuming not local"
+  return 1
+}
+
+# Stop Ollama regardless of how it was started
+stop_ollama() {
+  local was_running=false
+  
+  # Try service manager first if available
+  local service_manager=$(get_service_manager)
+  if [[ "$service_manager" == "systemd" ]] && systemctl is-active --quiet ollama; then
+    was_running=true
+    sudo systemctl stop ollama &>/dev/null
+  elif [[ "$service_manager" == "sysvinit" ]] && service ollama status 2>/dev/null | grep -q "running"; then
+    was_running=true
+    sudo service ollama stop &>/dev/null
+  fi
+  
+  # Try process kill if needed
+  if pgrep -x "ollama" &>/dev/null || pgrep -f "ollama serve" &>/dev/null; then
+    was_running=true
+    pkill -TERM -x "ollama" 2>/dev/null
+    pkill -TERM -f "ollama serve" 2>/dev/null
+    sleep 2
+    # Force kill if still running
+    pkill -KILL -x "ollama" 2>/dev/null
+    pkill -KILL -f "ollama serve" 2>/dev/null
+  fi
+  
+  # Verify Ollama is truly stopped
+  if ! curl -s --connect-timeout 2 http://localhost:11434/api/version &>/dev/null || is_container_running "$OLLAMA_CONTAINER_NAME"; then
+    # Either API is down or container is running (which means API is from container)
+    if $was_running; then
+      ((stopped_count++))
+      success "Local Ollama stopped"
+      return 0
+    fi
+  else
+    warning "Failed to stop local Ollama - API is still responding"
+    return 1
+  fi
+}
+
+# Main function to stop services
 stop_services() {
   info "Detecting active services..."
   local active_services=()
   local stopped_count=0
-  local any_services_found=false
   
-  # 1. Check OpenWebUI
-  if docker ps -q -f "name=^/${OPEN_WEBUI_NAME}$" &>/dev/null; then
-    active_services+=("OpenWebUI")
-    any_services_found=true
+  # Container checks - always do these first
+  local containers=("$OPEN_WEBUI_NAME:OpenWebUI" "$OLLAMA_CONTAINER_NAME:Ollama container" "$LOCALAI_NAME:LocalAI")
+  for container_def in "${containers[@]}"; do
+    local container_name="${container_def%%:*}"
+    local container_label="${container_def#*:}"
+    
+    if is_container_running "$container_name"; then
+      active_services+=("$container_label")
+      debug "$container_label is running"
+    fi
+  done
+  
+  # Check Local Ollama service AFTER checking containers
+  if is_local_ollama_running; then
+    active_services+=("Local Ollama")
+    debug "Local Ollama is running (not the container)"
   fi
   
-  # 2. Check Ollama in container
-  if docker ps -q -f "name=^/${OLLAMA_CONTAINER_NAME}$" &>/dev/null; then
-    active_services+=("Ollama container")
-    any_services_found=true
-  fi
-  
-  # 3. Check LocalAI
-  if docker ps -q -f "name=^/${LOCALAI_NAME}$" &>/dev/null; then
-    active_services+=("LocalAI")
-    any_services_found=true
-  fi
-  
-  # 4. Check local Ollama started by the script
-  # Use multiple methods to detect Ollama, not just systemd
-  local service_manager=$(get_service_manager)
-  case "$service_manager" in
-    "systemd")
-      if systemctl is-active ollama &>/dev/null; then
-        active_services+=("Local Ollama (systemd)")
-        any_services_found=true
-      fi
-      ;;
-    "sysvinit")
-      if service ollama status &>/dev/null; then
-        active_services+=("Local Ollama (service)")
-        any_services_found=true
-      fi
-      ;;
-  esac
-  
-  # Check for manually started Ollama process
-  if pgrep -f "ollama serve" &>/dev/null; then
-    active_services+=("Local Ollama (process)")
-    any_services_found=true
-  fi
-  
-  if ! $any_services_found; then
+  # If no services found, exit early
+  if [ ${#active_services[@]} -eq 0 ]; then
     info "No services started by the script are currently running."
     return 0
   fi
@@ -1104,42 +1177,19 @@ stop_services() {
     case "$service" in
       "OpenWebUI")
         info "Stopping OpenWebUI container..."
-        if docker stop $OPEN_WEBUI_NAME &>/dev/null; then
-          ((stopped_count++))
-          success "OpenWebUI container stopped"
-        else
-          warning "Unable to stop OpenWebUI container"
-        fi
+        stop_container "$OPEN_WEBUI_NAME"
         ;;
-      
       "Ollama container")
         info "Stopping Ollama container..."
-        if docker stop $OLLAMA_CONTAINER_NAME &>/dev/null; then
-          ((stopped_count++))
-          success "Ollama container stopped"
-        else
-          warning "Unable to stop Ollama container"
-        fi
+        stop_container "$OLLAMA_CONTAINER_NAME"
         ;;
-      
       "LocalAI")
         info "Stopping LocalAI container..."
-        if docker stop $LOCALAI_NAME &>/dev/null; then
-          ((stopped_count++))
-          success "LocalAI container stopped"
-        else
-          warning "Unable to stop LocalAI container"
-        fi
+        stop_container "$LOCALAI_NAME"
         ;;
-      
-      "Local Ollama (systemd)"|"Local Ollama (service)"|"Local Ollama (process)")
+      "Local Ollama")
         info "Stopping local Ollama..."
-        if manage_service "ollama" "stop"; then
-          ((stopped_count++))
-          success "Local Ollama stopped"
-        else
-          warning "Unable to stop local Ollama"
-        fi
+        stop_ollama
         ;;
     esac
   done
