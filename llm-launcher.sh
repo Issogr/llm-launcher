@@ -6,7 +6,6 @@
 # - Local Ollama
 # - Remote LM Studio server
 # - Ollama in Docker container with Intel GPU acceleration
-# - Local llama.cpp server
 # - LocalAI with Intel SYCL acceleration
 # ===========================================================
 
@@ -232,7 +231,7 @@ show_help() {
   echo "  --check-network           Check Docker network status and container connectivity"
   echo "  --stop                    Stop running containers and services started by this script"
   echo "  --non-interactive         Run with default options (must specify backend with --backend)"
-  echo "  --backend=TYPE            Specify backend type: ollama, lmstudio, ollama-container, llama-cpp, localai"
+  echo "  --backend=TYPE            Specify backend type: ollama, lmstudio, ollama-container, localai"
   echo "  --verbose                 Enable verbose output"
   echo "  --debug                   Enable debug output"
   echo "  --detect-hardware         Detect hardware and suggest settings"
@@ -257,7 +256,6 @@ setup_directories() {
     "${LLM_BASE_DIR}"                    # Base directory
     "${LLM_BASE_DIR}/models"             # All models
     "${LLM_BASE_DIR}/models/ollama"      # Ollama models
-    "${LLM_BASE_DIR}/models/llama_cpp"   # llama.cpp models
     "${LLM_BASE_DIR}/models/localai"     # LocalAI models
     "${LLM_BASE_DIR}/data"               # All application data
     "${LLM_BASE_DIR}/data/open-webui"    # OpenWebUI persistent data
@@ -327,10 +325,6 @@ OLLAMA_CONTAINER_PORT="11434"
 # LM Studio remote
 LM_STUDIO_HOST="192.168.1.154"
 LM_STUDIO_PORT="1234"
-
-# llama.cpp local
-LLAMA_CPP_HOST="localhost"
-LLAMA_CPP_PORT="8080"
 
 # LocalAI with Intel acceleration
 LOCALAI_IMAGE="localai/localai:v2.27.0-sycl-f16-ffmpeg"
@@ -535,21 +529,6 @@ configure_backend_params() {
         "-e OLLAMA_API_PORT=11434"
       )
       BACKEND_URL="$OLLAMA_URL_VAR/api/version"
-      ;;
-    
-    "llama-cpp")
-      OPENAI_API_KEY="llama-cpp"
-      OPENAI_API_HOST="host.docker.internal"
-      OPENAI_API_PORT=$LLAMA_CPP_PORT
-      OPENAI_API_BASE_URL="http://host.docker.internal:$LLAMA_CPP_PORT/v1"
-      EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
-      WEBUI_ENV_PARAMS=(
-        "-e OPENAI_API_KEY=$OPENAI_API_KEY"
-        "-e OPENAI_API_HOST=$OPENAI_API_HOST"
-        "-e OPENAI_API_PORT=$OPENAI_API_PORT"
-        "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
-      )
-      BACKEND_URL="http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/models"
       ;;
     
     "localai")
@@ -878,20 +857,7 @@ setup_ollama_container() {
   return 0
 }
 
-# Function to configure local llama.cpp (option 4)
-setup_llama_cpp() {
-  info "Configuring connection to local llama.cpp ($LLAMA_CPP_HOST:$LLAMA_CPP_PORT)..."
-  
-  # Use the generic connectivity check
-  check_endpoint_connectivity "http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT/v1/models" "llama.cpp" 3
-  
-  # Use the generic backend configuration function
-  configure_backend_params "llama-cpp"
-  
-  return 0
-}
-
-# Function to configure and start LocalAI with Intel acceleration (option 5)
+# Function to configure and start LocalAI with Intel acceleration (option 4)
 setup_localai() {
   info "Configuring LocalAI with Intel acceleration (SYCL)..."
   
@@ -988,7 +954,7 @@ verify_connectivity() {
     "ollama-container")
       test_url="$BACKEND_URL"
       ;;
-    "lmstudio"|"llama-cpp")
+    "lmstudio")
       test_url="$BACKEND_URL"
       ;;
     "localai")
@@ -1025,9 +991,6 @@ show_access_info() {
       ;;
     "lmstudio")
       echo -e "LM Studio API is accessible at: ${BLUE}http://$LM_STUDIO_HOST:$LM_STUDIO_PORT${NC}"
-      ;;
-    "llama-cpp")
-      echo -e "llama.cpp API is accessible at: ${BLUE}http://$LLAMA_CPP_HOST:$LLAMA_CPP_PORT${NC}"
       ;;
     "localai")
       echo -e "LocalAI API is accessible at: ${BLUE}http://localhost:${LOCALAI_PORT}${NC}"
@@ -1231,9 +1194,9 @@ main() {
   done
   
   # Validate automated mode parameters
-  if $non_interactive && [[ ! "$backend_choice" =~ ^(ollama|lmstudio|ollama-container|llama-cpp|localai)$ ]]; then
+  if $non_interactive && [[ ! "$backend_choice" =~ ^(ollama|lmstudio|ollama-container|localai)$ ]]; then
     error "Invalid or missing backend choice for non-interactive mode"
-    echo "Must specify one of: ollama, lmstudio, ollama-container, llama-cpp, localai"
+    echo "Must specify one of: ollama, lmstudio, ollama-container, localai"
     exit 1
   fi
   
@@ -1260,13 +1223,12 @@ main() {
     echo "1 - Ollama on your local host"
     echo "2 - LM Studio on another PC ($LM_STUDIO_HOST:$LM_STUDIO_PORT)"
     echo "3 - Ollama in Docker container (with Intel GPU)"
-    echo "4 - Local llama.cpp on $LLAMA_CPP_HOST:$LLAMA_CPP_PORT (OpenAI compatible)"
-    echo "5 - LocalAI with Intel acceleration (SYCL)"
-    read -p "Enter your choice (1/2/3/4/5): " choice
+    echo "4 - LocalAI with Intel acceleration (SYCL)"
+    read -p "Enter your choice (1/2/3/4): " choice
     echo
     
-    if [[ ! "$choice" =~ ^[1-5]$ ]]; then
-      error "Invalid choice. Please enter a number from 1 to 5."
+    if [[ ! "$choice" =~ ^[1-4]$ ]]; then
+      error "Invalid choice. Please enter a number from 1 to 4."
       exit 1
     fi
   else
@@ -1275,8 +1237,7 @@ main() {
       "ollama") choice=1 ;;
       "lmstudio") choice=2 ;;
       "ollama-container") choice=3 ;;
-      "llama-cpp") choice=4 ;;
-      "localai") choice=5 ;;
+      "localai") choice=4 ;;
     esac
   fi
   
@@ -1286,8 +1247,7 @@ main() {
     1) setup_local_ollama && backend_setup_success=true ;;
     2) setup_lm_studio && backend_setup_success=true ;;
     3) setup_ollama_container && backend_setup_success=true ;;
-    4) setup_llama_cpp && backend_setup_success=true ;;
-    5) setup_localai && backend_setup_success=true ;;
+    4) setup_localai && backend_setup_success=true ;;
   esac
   
   if ! $backend_setup_success; then
