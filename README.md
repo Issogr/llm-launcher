@@ -13,6 +13,8 @@ LLM Launcher is a Bash script that simplifies setting up and launching OpenWebUI
 - [💻 Installation & Usage](#-installation--usage)
 - [⚙️ Configuration Options](#️-configuration-options)
 - [🖥️ Accessing the UI](#️-accessing-the-ui)
+- [📡 Network Diagnostics](#-network-diagnostics)
+- [🛠️ Hardware Detection](#-hardware-detection)
 - [📝 License](#-license)
 - [🙏 Acknowledgments](#-acknowledgments)
 
@@ -32,6 +34,7 @@ Before using this script, you need to have the following installed:
 - Docker (and Docker service running)
 - Curl for connectivity testing
 - One of the following text editors: nano, vim, vi (or set your $EDITOR environment variable)
+- Docker permissions for the current user (or ability to run sudo commands)
 
 Additionally, depending on your chosen backend:
 - For option 1: Local Ollama installation
@@ -70,6 +73,8 @@ The script offers various options to adapt to your needs:
 - `--stop`: Stop containers and services started by this script
 - `--non-interactive`: Run with default options (requires --backend)
 - `--backend=TYPE`: Specify backend type: ollama, lmstudio, ollama-container, localai
+- `--verbose`: Enable verbose output
+- `--debug`: Enable debug output
 - `--detect-hardware`: Detect hardware capabilities and suggest settings
 
 The script will automatically:
@@ -84,6 +89,8 @@ The configuration file (`~/llm/llm-launcher.conf`) contains these customizable s
 
 ### Main Settings
 - `DOCKER_NETWORK`: Name of the Docker network for container communication
+- `OPEN_WEBUI_IMAGE`: Docker image for OpenWebUI
+- `OPEN_WEBUI_NAME`: Name of the OpenWebUI container
 - `OPEN_WEBUI_PORT`: Port for accessing OpenWebUI on your host (default: 3000)
 - `MEMORY_LIMIT`: Memory limit for containers (e.g., "30G")
 - `SHM_SIZE`: Shared memory size (e.g., "20g")
@@ -98,10 +105,13 @@ The configuration file (`~/llm/llm-launcher.conf`) contains these customizable s
 - `LM_STUDIO_PORT`: Port of the LM Studio API
 
 **Ollama in Container**:
-- `OLLAMA_CONTAINER_PORT`: Port for accessing Ollama's API on your host
 - `OLLAMA_CONTAINER_IMAGE`: Docker image for Ollama
+- `OLLAMA_CONTAINER_NAME`: Name of the Ollama container
+- `OLLAMA_CONTAINER_PORT`: Port for accessing Ollama's API on your host
 
 **LocalAI**:
+- `LOCALAI_IMAGE`: Docker image for LocalAI
+- `LOCALAI_NAME`: Name of the LocalAI container
 - `LOCALAI_PORT`: Port for accessing LocalAI's API on your host
 - `LOCALAI_MODEL`: Default model to load (e.g., "gemma-3-4b-it-qat")
 - `LOCALAI_EXTRA_FLAGS`: Additional flags to pass to LocalAI (e.g., "--threads 4")
@@ -114,6 +124,33 @@ http://localhost:[CONFIGURED_PORT]
 ```
 
 The default port is 3000 unless you changed it in the configuration.
+
+## 📡 Network Diagnostics
+
+The script includes a network diagnostic feature to help you troubleshoot any connectivity issues between containers:
+
+```bash
+./llm-launcher.sh --check-network
+```
+
+This option will check:
+- Status of the configured Docker network
+- List of containers in the network
+- Connectivity between containers
+
+## 🛠️ Hardware Detection
+
+The script can automatically detect your system's hardware capabilities and suggest optimal settings:
+
+```bash
+./llm-launcher.sh --detect-hardware
+```
+
+It detects:
+- Total available memory
+- Number of CPU cores
+- GPU type (NVIDIA, AMD, Intel) and specific model for Intel GPUs
+- Suggestions for memory, shared memory size, and thread count
 
 ## 📝 License
 
