@@ -15,6 +15,8 @@ LLM Launcher is a Bash script that simplifies setting up and launching OpenWebUI
 - [🖥️ Accessing the UI](#️-accessing-the-ui)
 - [📡 Network Diagnostics](#-network-diagnostics)
 - [🛠️ Hardware Detection](#-hardware-detection)
+- [🐛 Known Issues & Limitations](#-known-issues--limitations)
+- [📋 TODO List](#-todo-list)
 - [📝 License](#-license)
 - [🙏 Acknowledgments](#-acknowledgments)
 
@@ -151,6 +153,26 @@ It detects:
 - Number of CPU cores
 - GPU type (NVIDIA, AMD, Intel) and specific model for Intel GPUs
 - Suggestions for memory, shared memory size, and thread count
+
+## 🐛 Known Issues & Limitations
+
+The following issues have been identified in the current implementation:
+
+### Ollama in Container
+- **Gemma3 Compatibility Issue**: Currently, Ollama in container has issues managing the Gemma3 model. The model downloads correctly but cannot be utilized through the interface afterward.
+
+### LocalAI Implementation
+- **OpenWebUI Integration**: Communication between LocalAI and OpenWebUI is not functioning correctly in the current implementation.
+- **Hardware Optimization**: Unlike the Ollama container, LocalAI is not properly configured to optimally utilize the available hardware.
+
+## 📋 TODO List
+
+The following features are under development:
+
+- **Dynamic IP for LM-Studio**: Make the IP address definition for LM-Studio connections dynamic.
+- **Improved Configuration Management**: Optimize configuration handling to ensure each parameter is defined only once within the script.
+- **Configuration Unification**: Ensure that when a value is modified, the change is automatically reflected in all parts of the script where that value is used.
+- **Complete LocalAI Implementation**: Finalize the LocalAI implementation by resolving integration issues with OpenWebUI.
 
 ## 📝 License
 
