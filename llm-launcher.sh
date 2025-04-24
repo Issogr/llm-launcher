@@ -508,13 +508,9 @@ configure_backend_params() {
     
     "lmstudio")
       OPENAI_API_KEY="lm-studio"
-      OPENAI_API_HOST=$LM_STUDIO_HOST
-      OPENAI_API_PORT=$LM_STUDIO_PORT
       OPENAI_API_BASE_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1"
       WEBUI_ENV_PARAMS=(
         "-e OPENAI_API_KEY=$OPENAI_API_KEY"
-        "-e OPENAI_API_HOST=$OPENAI_API_HOST"
-        "-e OPENAI_API_PORT=$OPENAI_API_PORT"
         "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
       )
       BACKEND_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models"
