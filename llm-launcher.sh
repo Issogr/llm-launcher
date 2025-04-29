@@ -570,9 +570,24 @@ manage_service() {
   
   case "$service_manager" in
     "systemd")
-      if systemctl list-unit-files | grep -q $service_name; then
+      # Note: status returns 0 if active, 3 if inactive, 4 if failed, any other value if it does not exist
+      systemctl status $service_name &>/dev/null
+      local retval=$?
+      if [ $retval -eq 0 ] || [ $retval -eq 3 ] || [ $retval -eq 4 ]; then
+        debug "Servizio $service_name trovato in systemd (stato: $retval)"
         sudo systemctl $action $service_name
         return $?
+      else
+        # Prova anche con .service appeso
+        systemctl status $service_name.service &>/dev/null
+        local retval=$?
+        if [ $retval -eq 0 ] || [ $retval -eq 3 ] || [ $retval -eq 4 ]; then
+          debug "Servizio $service_name.service trovato in systemd (stato: $retval)"
+          sudo systemctl $action $service_name.service
+          return $?
+        else
+          debug "Servizio $service_name non trovato in systemd"
+        fi
       fi
       ;;
     "sysvinit")
