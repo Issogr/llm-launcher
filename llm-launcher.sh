@@ -78,6 +78,17 @@ prompt_with_timeout() {
   return $?
 }
 
+# Detect operating system
+detect_os() {
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "macos"
+  elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    echo "linux"
+  else
+    echo "unknown"
+  fi
+}
+
 # Check if script is run as root
 check_root() {
   if [[ $EUID -eq 0 ]]; then
@@ -99,7 +110,35 @@ check_docker_permissions() {
     return 1
   fi
   
-  # Check if user can run docker without sudo
+  # Detect OS type
+  local OS_TYPE=$(detect_os)
+  
+  # Check for Orb Stack on macOS
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    if [ -d "/Applications/OrbStack.app" ] || [ -f "$HOME/.orbstack/bin/docker" ]; then
+      info "OrbStack detected on macOS"
+      
+      # Ensure OrbStack's Docker is in the PATH if not already
+      if ! docker info &>/dev/null; then
+        if [ -f "$HOME/.orbstack/bin/docker" ]; then
+          export PATH="$HOME/.orbstack/bin:$PATH"
+          info "Added OrbStack's Docker to PATH"
+        fi
+      fi
+      
+      # Try again after PATH adjustment
+      if docker info &>/dev/null; then
+        success "OrbStack Docker configuration verified"
+        return 0
+      else
+        error "OrbStack Docker seems to be installed but not functioning properly."
+        error "Please ensure OrbStack is running before continuing."
+        return 1
+      fi
+    fi
+  fi
+  
+  # Standard Docker check (original code)
   if ! docker info &>/dev/null; then
     warning "Cannot run Docker commands. Checking if sudo access is available..."
     
@@ -123,7 +162,12 @@ check_docker_permissions() {
       fi
     else
       error "Cannot run Docker commands and sudo is not available."
-      error "Please ensure Docker is properly installed and your user has proper permissions."
+      if [[ "$OS_TYPE" == "macos" ]]; then
+        error "If you're using OrbStack, make sure it's running and properly configured."
+        error "You may need to restart OrbStack, or restart your terminal to update your PATH."
+      else
+        error "Please ensure Docker is properly installed and your user has proper permissions."
+      fi
       return 1
     fi
   fi
@@ -529,10 +573,24 @@ configure_backend_params() {
     "lmstudio")
       OPENAI_API_KEY="lm-studio"
       OPENAI_API_BASE_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1"
-      WEBUI_ENV_PARAMS=(
-        "-e OPENAI_API_KEY=$OPENAI_API_KEY"
-        "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
-      )
+      
+      # Special handling for macOS with OrbStack
+      local OS_TYPE=$(detect_os)
+      if [[ "$OS_TYPE" == "macos" && "$LM_STUDIO_HOST" == "localhost" ]]; then
+        # On macOS with localhost, configure for proper container-to-host networking
+        WEBUI_ENV_PARAMS=(
+          "-e OPENAI_API_KEY=$OPENAI_API_KEY"
+          "-e OPENAI_API_BASE_URL=http://host.docker.internal:$LM_STUDIO_PORT/v1"
+        )
+        EXTRA_PARAMS="--add-host=host.docker.internal:host-gateway"
+      else
+        # Standard configuration
+        WEBUI_ENV_PARAMS=(
+          "-e OPENAI_API_KEY=$OPENAI_API_KEY"
+          "-e OPENAI_API_BASE_URL=$OPENAI_API_BASE_URL"
+        )
+      fi
+      
       BACKEND_URL="http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models"
       ;;
     
@@ -839,7 +897,14 @@ setup_local_ollama() {
 
 # Function to configure remote LM Studio (option 2)
 setup_lm_studio() {
-  info "Configuring to use LM Studio on another PC ($LM_STUDIO_HOST:$LM_STUDIO_PORT)..."
+  # Check if we're on macOS
+  local OS_TYPE=$(detect_os)
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    info "macOS detected, using localhost for LM Studio..."
+    LM_STUDIO_HOST="localhost"
+  fi
+
+  info "Configuring to use LM Studio on $LM_STUDIO_HOST:$LM_STUDIO_PORT..."
   
   # Use the generic connectivity check
   check_endpoint_connectivity "http://$LM_STUDIO_HOST:$LM_STUDIO_PORT/v1/models" "LM Studio" 3
@@ -1325,7 +1390,7 @@ main() {
     echo
     echo "Choose which backend you want to use:"
     echo "1 - Ollama on your local host"
-    echo "2 - LM Studio on another PC ($LM_STUDIO_HOST:$LM_STUDIO_PORT)"
+    echo "2 - LM Studio (uses localhost on macOS, $LM_STUDIO_HOST:$LM_STUDIO_PORT on other systems)"
     echo "3 - Ollama in Docker container (with Intel GPU)"
     echo "4 - LocalAI with Intel acceleration (SYCL)"
     read -p "Enter your choice (1/2/3/4): " choice
