@@ -37,6 +37,83 @@ warning() { echo -e "${YELLOW}WARNING: $1${NC}"; echo; }
 info() { echo -e "${BLUE}INFO: $1${NC}"; }
 debug() { [[ "$DEBUG" == "true" ]] && echo -e "${CYAN}DEBUG: $1${NC}"; }
 
+# Detect operating system
+detect_os() {
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "macos"
+  elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    echo "linux"
+  else
+    echo "unknown"
+  fi
+}
+
+# Get system RAM in GB
+get_system_memory() {
+  local OS_TYPE=$(detect_os)
+  local memory_gb
+  
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    if command -v sysctl &> /dev/null; then
+      # Convert bytes to GB (1024^3)
+      memory_gb=$(($(sysctl -n hw.memsize) / 1024 / 1024 / 1024))
+      echo $memory_gb
+      return 0
+    fi
+  else  # Linux
+    if command -v free &> /dev/null; then
+      memory_gb=$(free -g | awk '/^Mem:/{print $2}')
+      echo $memory_gb
+      return 0
+    fi
+  fi
+  
+  # If we couldn't determine memory, estimate based on CPU cores
+  local cpu_cores=$(get_cpu_cores)
+  if [[ $cpu_cores -le 4 ]]; then
+    echo 4  # Minimum estimation
+  else
+    echo $((cpu_cores * 2))  # Estimate 2GB per core
+  fi
+}
+
+# Get CPU cores count
+get_cpu_cores() {
+  local OS_TYPE=$(detect_os)
+  
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    if command -v sysctl &> /dev/null; then
+      sysctl -n hw.ncpu
+      return 0
+    fi
+  else  # Linux
+    if command -v nproc &> /dev/null; then
+      nproc --all
+      return 0
+    elif command -v grep &> /dev/null && [ -f /proc/cpuinfo ]; then
+      grep -c processor /proc/cpuinfo
+      return 0
+    fi
+  fi
+  
+  # Fallback to a reasonable minimum if cannot determine
+  echo 2
+}
+
+# Cross-platform sed in-place replacement
+sed_in_place() {
+  local file="$1"
+  local pattern="$2"
+  local replacement="$3"
+  
+  local OS_TYPE=$(detect_os)
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    sed -i '' "s|$pattern|$replacement|g" "$file"
+  else
+    sed -i "s|$pattern|$replacement|g" "$file"
+  fi
+}
+
 # Improved signal handling and cleanup
 cleanup() {
   info "Cleaning up..."
@@ -78,17 +155,6 @@ prompt_with_timeout() {
   return $?
 }
 
-# Detect operating system
-detect_os() {
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    echo "macos"
-  elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    echo "linux"
-  else
-    echo "unknown"
-  fi
-}
-
 # Check if script is run as root
 check_root() {
   if [[ $EUID -eq 0 ]]; then
@@ -98,6 +164,111 @@ check_root() {
       exit 1
     fi
   fi
+}
+
+# Detect GPU type and characteristics - improved version
+detect_gpu() {
+  local OS_TYPE=$(detect_os)
+  local GPU_TYPE="NONE"
+  local GPU_PARAMS=""
+  local INTEL_GPU_DEVICE=""
+  
+  if [[ "$OS_TYPE" == "macos" ]]; then
+    # GPU detection for macOS
+    if command -v system_profiler &> /dev/null; then
+      local GPU_INFO=$(system_profiler SPDisplaysDataType 2>/dev/null)
+      if echo "$GPU_INFO" | grep -q "Vendor Name: Apple"; then
+        GPU_TYPE="APPLE"
+        debug "Apple Silicon GPU detected"
+      elif echo "$GPU_INFO" | grep -q "Vendor Name: AMD"; then
+        GPU_TYPE="AMD"
+        debug "AMD GPU detected in macOS"
+      elif echo "$GPU_INFO" | grep -q "Vendor Name: Intel"; then
+        GPU_TYPE="INTEL"
+        INTEL_GPU_DEVICE="iGPU"
+        debug "Intel GPU detected in macOS"
+      else
+        debug "No specific GPU type detected in macOS"
+      fi
+    fi
+  else
+    # Linux GPU detection
+    if command -v lspci &>/dev/null; then
+      local GPU_INFO=$(lspci | grep -i 'vga\|3d\|display')
+      if [[ $GPU_INFO =~ [Nn][Vv][Ii][Dd][Ii][Aa] ]]; then
+        GPU_TYPE="NVIDIA"
+        GPU_PARAMS="--gpus all"
+        debug "NVIDIA GPU detected"
+      elif [[ $GPU_INFO =~ [Aa][Mm][Dd] ]]; then
+        GPU_TYPE="AMD"
+        GPU_PARAMS="--device=/dev/dri"
+        debug "AMD GPU detected"
+      elif [[ $GPU_INFO =~ [Ii][Nn][Tt][Ee][Ll] ]]; then
+        GPU_TYPE="INTEL"
+        GPU_PARAMS="--device=/dev/dri"
+        
+        # Determine specific Intel GPU type
+        INTEL_GPU_DEVICE="iGPU"  # Start with a reasonable baseline
+        
+        if [[ $GPU_INFO =~ [Mm][Aa][Xx].[Ss][Ee][Rr][Ii][Ee][Ss] ]]; then
+          INTEL_GPU_DEVICE="Max"
+          debug "Intel Max Series GPU detected"
+        elif [[ $GPU_INFO =~ [Ff][Ll][Ee][Xx].[Ss][Ee][Rr][Ii][Ee][Ss] ]]; then
+          INTEL_GPU_DEVICE="Flex"
+          debug "Intel Flex Series GPU detected"
+        elif [[ $GPU_INFO =~ [Aa][Rr][Cc] ]]; then
+          INTEL_GPU_DEVICE="Arc"
+          debug "Intel Arc GPU detected"
+        else
+          debug "Intel integrated GPU detected, using iGPU as device type"
+        fi
+        
+        debug "Intel GPU detected, DEVICE=${INTEL_GPU_DEVICE}"
+      else
+        debug "No supported GPU detected via lspci"
+      fi
+    else
+      # Try alternative GPU detection methods if lspci isn't available
+      if command -v glxinfo &>/dev/null; then
+        local GLXINFO=$(glxinfo 2>/dev/null | grep -i "vendor\|renderer")
+        if [[ $GLXINFO =~ [Nn][Vv][Ii][Dd][Ii][Aa] ]]; then
+          GPU_TYPE="NVIDIA"
+          GPU_PARAMS="--gpus all"
+          debug "NVIDIA GPU detected via glxinfo"
+        elif [[ $GLXINFO =~ [Aa][Mm][Dd] ]]; then
+          GPU_TYPE="AMD"
+          GPU_PARAMS="--device=/dev/dri"
+          debug "AMD GPU detected via glxinfo"
+        elif [[ $GLXINFO =~ [Ii][Nn][Tt][Ee][Ll] ]]; then
+          GPU_TYPE="INTEL"
+          INTEL_GPU_DEVICE="iGPU"
+          GPU_PARAMS="--device=/dev/dri"
+          debug "Intel GPU detected via glxinfo"
+        fi
+      elif [ -d "/sys/class/drm" ]; then
+        # Check Linux DRM subsystem
+        if grep -q "i915" /sys/class/drm/*/device/driver 2>/dev/null; then
+          GPU_TYPE="INTEL"
+          INTEL_GPU_DEVICE="iGPU"
+          GPU_PARAMS="--device=/dev/dri"
+          debug "Intel GPU detected via DRM subsystem"
+        elif grep -q "amdgpu" /sys/class/drm/*/device/driver 2>/dev/null; then
+          GPU_TYPE="AMD"
+          GPU_PARAMS="--device=/dev/dri"
+          debug "AMD GPU detected via DRM subsystem"
+        elif grep -q "nvidia" /sys/class/drm/*/device/driver 2>/dev/null; then
+          GPU_TYPE="NVIDIA"
+          GPU_PARAMS="--gpus all"
+          debug "NVIDIA GPU detected via DRM subsystem"
+        fi
+      else
+        debug "Could not detect GPU using available methods"
+      fi
+    fi
+  fi
+  
+  # Return results as JSON-like string that can be parsed
+  echo "GPU_TYPE=\"$GPU_TYPE\" GPU_PARAMS=\"$GPU_PARAMS\" INTEL_GPU_DEVICE=\"$INTEL_GPU_DEVICE\""
 }
 
 # Check Docker permissions
@@ -175,71 +346,56 @@ check_docker_permissions() {
   return 0
 }
 
-# Hardware detection and automatic resource allocation
+# Hardware detection and automatic resource allocation - completely dynamic
 detect_hardware() {
   info "Detecting hardware capabilities..."
   
-  # Detect total memory
-  local TOTAL_MEM=$(free -g | awk '/^Mem:/{print $2}')
-  if [[ $TOTAL_MEM -lt 8 ]]; then
+  # Get memory and CPU cores dynamically
+  local TOTAL_MEM=$(get_system_memory)
+  local CPU_CORES=$(get_cpu_cores)
+  
+  # Calculate recommended values based on available resources
+  if [[ $TOTAL_MEM -lt 4 ]]; then
+    warning "Very low memory detected: ${TOTAL_MEM}G. Performance will be severely limited."
+    RECOMMENDED_MEM="${TOTAL_MEM}G"
+    RECOMMENDED_SHM="1g"  # Minimum shared memory
+  elif [[ $TOTAL_MEM -lt 8 ]]; then
     warning "Low memory detected: ${TOTAL_MEM}G. This may impact performance."
     RECOMMENDED_MEM="${TOTAL_MEM}G"
-    RECOMMENDED_SHM="$((TOTAL_MEM / 2))g"
+    RECOMMENDED_SHM="$((TOTAL_MEM / 2))g"  # Half of available memory
   else
-    RECOMMENDED_MEM="$((TOTAL_MEM * 80 / 100))G"  # 80% of available memory
-    RECOMMENDED_SHM="$((TOTAL_MEM * 50 / 100))g"  # 50% of available memory
-  fi
-  
-  # Detect CPU cores
-  local CPU_CORES=$(nproc --all)
-  RECOMMENDED_THREADS=$((CPU_CORES > 4 ? CPU_CORES - 2 : CPU_CORES))
-  
-  # Detect GPU type
-  if command -v lspci &>/dev/null; then
-    local GPU_INFO=$(lspci | grep -i 'vga\|3d\|display')
-    if [[ $GPU_INFO =~ [Nn][Vv][Ii][Dd][Ii][Aa] ]]; then
-      GPU_TYPE="NVIDIA"
-      GPU_PARAMS="--gpus all"
-      debug "NVIDIA GPU detected"
-    elif [[ $GPU_INFO =~ [Aa][Mm][Dd] ]]; then
-      GPU_TYPE="AMD"
-      GPU_PARAMS="--device=/dev/dri"
-      debug "AMD GPU detected"
-    elif [[ $GPU_INFO =~ [Ii][Nn][Tt][Ee][Ll] ]]; then
-      GPU_TYPE="INTEL"
-      GPU_PARAMS="--device=/dev/dri"
-      
-      # Determine specific Intel GPU type
-      INTEL_GPU_DEVICE="iGPU"  # Default to iGPU
-      
-      if [[ $GPU_INFO =~ [Mm][Aa][Xx].[Ss][Ee][Rr][Ii][Ee][Ss] ]]; then
-        INTEL_GPU_DEVICE="Max"
-        debug "Intel Max Series GPU detected"
-      elif [[ $GPU_INFO =~ [Ff][Ll][Ee][Xx].[Ss][Ee][Rr][Ii][Ee][Ss] ]]; then
-        INTEL_GPU_DEVICE="Flex"
-        debug "Intel Flex Series GPU detected"
-      elif [[ $GPU_INFO =~ [Aa][Rr][Cc] ]]; then
-        INTEL_GPU_DEVICE="Arc"
-        debug "Intel Arc GPU detected"
-      else
-        debug "Intel integrated GPU detected, using iGPU as device type"
-      fi
-      
-      debug "Intel GPU detected, DEVICE=${INTEL_GPU_DEVICE}"
+    # Allocate 80% of memory for container, but cap at 64GB
+    local PERCENT_MEM=$((TOTAL_MEM * 80 / 100))
+    if [[ $PERCENT_MEM -gt 64 ]]; then
+      RECOMMENDED_MEM="64G"  # Cap at 64GB
     else
-      GPU_TYPE="NONE"
-      GPU_PARAMS=""
-      debug "No supported GPU detected"
+      RECOMMENDED_MEM="${PERCENT_MEM}G"
     fi
-  else
-    GPU_TYPE="UNKNOWN"
-    GPU_PARAMS="--device=/dev/dri"
-    debug "Cannot detect GPU (lspci not available)"
+    
+    # For larger memory systems, limit shared memory to 16GB
+    if [[ $TOTAL_MEM -gt 32 ]]; then
+      RECOMMENDED_SHM="16g"
+    else
+      RECOMMENDED_SHM="$((TOTAL_MEM * 50 / 100))g"  # 50% of available memory
+    fi
   fi
+  
+  # Calculate optimal thread count based on CPU cores
+  if [[ $CPU_CORES -le 2 ]]; then
+    RECOMMENDED_THREADS=$CPU_CORES  # Use all cores if only 1-2 available
+  elif [[ $CPU_CORES -le 6 ]]; then
+    RECOMMENDED_THREADS=$((CPU_CORES - 1))  # Leave 1 core for system
+  else
+    RECOMMENDED_THREADS=$((CPU_CORES - 2))  # Leave 2 cores for system
+  fi
+  
+  # Detect GPU - use the improved, fully dynamic function
+  local GPU_DETECTION=$(detect_gpu)
+  eval "$GPU_DETECTION"  # This sets GPU_TYPE, GPU_PARAMS, and INTEL_GPU_DEVICE
   
   # Print hardware summary
   info "System resources detected:"
-  info "  - Memory: ${TOTAL_MEM}G (Recommended: ${RECOMMENDED_MEM})"
+  info "  - Memory: ${TOTAL_MEM}G (Recommended usage: ${RECOMMENDED_MEM})"
   info "  - CPU Cores: ${CPU_CORES} (Recommended threads: ${RECOMMENDED_THREADS})"
   info "  - GPU Type: ${GPU_TYPE}"
   if [[ "$GPU_TYPE" == "INTEL" ]]; then
@@ -252,24 +408,44 @@ detect_hardware() {
     # Only suggest changes if values are significantly different
     if [[ ${MEMORY_LIMIT%[A-Za-z]} -lt ${RECOMMENDED_MEM%[A-Za-z]} ]]; then
       if prompt_with_timeout "${YELLOW}Current memory limit (${MEMORY_LIMIT}) is less than recommended (${RECOMMENDED_MEM}). Update? (y/n):${NC}" 10 "n"; then
-        sed -i "s/^MEMORY_LIMIT=.*/MEMORY_LIMIT=\"${RECOMMENDED_MEM}\"/" "${CONFIG_FILE}"
+        sed_in_place "${CONFIG_FILE}" "^MEMORY_LIMIT=.*" "MEMORY_LIMIT=\"${RECOMMENDED_MEM}\""
         MEMORY_LIMIT="${RECOMMENDED_MEM}"
       fi
     fi
     if [[ ${SHM_SIZE%[A-Za-z]} -lt ${RECOMMENDED_SHM%[A-Za-z]} ]]; then
       if prompt_with_timeout "${YELLOW}Current shared memory (${SHM_SIZE}) is less than recommended (${RECOMMENDED_SHM}). Update? (y/n):${NC}" 10 "n"; then
-        sed -i "s/^SHM_SIZE=.*/SHM_SIZE=\"${RECOMMENDED_SHM}\"/" "${CONFIG_FILE}"
+        sed_in_place "${CONFIG_FILE}" "^SHM_SIZE=.*" "SHM_SIZE=\"${RECOMMENDED_SHM}\""
         SHM_SIZE="${RECOMMENDED_SHM}"
       fi
     fi
-    # Update extra flags for LocalAI
-    if [[ "${LOCALAI_EXTRA_FLAGS}" != *"--threads ${RECOMMENDED_THREADS}"* ]]; then
-      if prompt_with_timeout "${YELLOW}Update LocalAI thread count to ${RECOMMENDED_THREADS}? (y/n):${NC}" 10 "n"; then
-        sed -i "s/^LOCALAI_EXTRA_FLAGS=.*/LOCALAI_EXTRA_FLAGS=\"--threads ${RECOMMENDED_THREADS}\"/" "${CONFIG_FILE}"
-        LOCALAI_EXTRA_FLAGS="--threads ${RECOMMENDED_THREADS}"
+    # Update extra flags for LocalAI with more sophisticated thread detection
+    local CURRENT_THREADS=1
+    if [[ "${LOCALAI_EXTRA_FLAGS}" =~ --threads[[:space:]]+([0-9]+) ]]; then
+      CURRENT_THREADS="${BASH_REMATCH[1]}"
+    fi
+    
+    if [[ $CURRENT_THREADS -ne $RECOMMENDED_THREADS ]]; then
+      if prompt_with_timeout "${YELLOW}Update LocalAI thread count from ${CURRENT_THREADS} to ${RECOMMENDED_THREADS}? (y/n):${NC}" 10 "n"; then
+        # Remove any existing threads parameter and add our recommended one
+        local NEW_FLAGS="${LOCALAI_EXTRA_FLAGS}"
+        NEW_FLAGS=$(echo "$NEW_FLAGS" | sed -E 's/--threads[[:space:]]+[0-9]+//')
+        NEW_FLAGS="$NEW_FLAGS --threads ${RECOMMENDED_THREADS}"
+        # Clean up any duplicate spaces
+        NEW_FLAGS=$(echo "$NEW_FLAGS" | sed -E 's/[[:space:]]+/ /g' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+        
+        sed_in_place "${CONFIG_FILE}" "^LOCALAI_EXTRA_FLAGS=.*" "LOCALAI_EXTRA_FLAGS=\"${NEW_FLAGS}\""
+        LOCALAI_EXTRA_FLAGS="${NEW_FLAGS}"
       fi
     fi
   fi
+  
+  # Export variables for use by other functions
+  export RECOMMENDED_MEM
+  export RECOMMENDED_SHM
+  export RECOMMENDED_THREADS
+  export GPU_TYPE
+  export GPU_PARAMS
+  export INTEL_GPU_DEVICE
 }
 
 # Check service system (systemd or other)
@@ -344,7 +520,7 @@ setup_directories() {
   fi
 }
 
-# Function to create the default configuration file
+# Function to create the default configuration file - fully dynamic
 create_default_config() {
   info "Checking configuration file status..."
   
@@ -361,18 +537,99 @@ create_default_config() {
     fi
   fi
   
-  info "Creating the default configuration file..."
+  info "Creating the default configuration file with dynamically detected settings..."
   
-  # Detect hardware for better defaults
-  local DETECTED_MEM=$(free -g | awk '/^Mem:/{print $2}')
-  local MEM_LIMIT="$((DETECTED_MEM * 80 / 100))G"  # 80% of available memory
-  local SHARE_MEM="$((DETECTED_MEM / 2))g"  # 50% of available memory
-  local CPU_CORES=$(nproc --all)
-  local THREADS=$((CPU_CORES > 4 ? CPU_CORES - 2 : CPU_CORES))
+  # Get system resources - fully dynamic
+  local DETECTED_MEM=$(get_system_memory)
+  local CPU_CORES=$(get_cpu_cores)
   
+  # Calculate memory limits based on available resources
+  local MEM_LIMIT
+  local SHARE_MEM
+  
+  if [[ $DETECTED_MEM -lt 4 ]]; then
+    MEM_LIMIT="${DETECTED_MEM}G"
+    SHARE_MEM="1g"
+  elif [[ $DETECTED_MEM -lt 8 ]]; then
+    MEM_LIMIT="${DETECTED_MEM}G"
+    SHARE_MEM="$((DETECTED_MEM / 2))g"
+  else
+    local PERCENT_MEM=$((DETECTED_MEM * 80 / 100))
+    if [[ $PERCENT_MEM -gt 64 ]]; then
+      MEM_LIMIT="64G"
+    else
+      MEM_LIMIT="${PERCENT_MEM}G"
+    fi
+    
+    if [[ $DETECTED_MEM -gt 32 ]]; then
+      SHARE_MEM="16g"
+    else
+      SHARE_MEM="$((DETECTED_MEM * 50 / 100))g"
+    fi
+  fi
+  
+  # Calculate thread count based on CPU cores
+  local THREADS
+  if [[ $CPU_CORES -le 2 ]]; then
+    THREADS=$CPU_CORES
+  elif [[ $CPU_CORES -le 6 ]]; then
+    THREADS=$((CPU_CORES - 1))
+  else
+    THREADS=$((CPU_CORES - 2))
+  fi
+  
+  # Detect LM Studio port availability
+  local LM_STUDIO_PORT="1234"
+  # Check if port 1234 is already in use on a different machine
+  if command -v nc &> /dev/null && command -v grep &> /dev/null; then
+    if nc -z localhost 1234 &>/dev/null; then
+      info "Default LM Studio port 1234 is available on localhost"
+    else
+      info "Checking network for potential LM Studio servers..."
+      # Try to discover LM Studio on the local network
+      local found_server=false
+      local found_ip=""
+      
+      # Only attempt network scan if nmap is available
+      if command -v nmap &> /dev/null; then
+        # Get local IP range
+        local IP_BASE=""
+        if command -v ip &> /dev/null; then
+          IP_BASE=$(ip route | grep default | awk '{print $3}' | sed 's/\.[0-9]*$/./')
+        elif command -v ifconfig &> /dev/null; then
+          IP_BASE=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | sed 's/\.[0-9]*$/./')
+        fi
+        
+        if [ -n "$IP_BASE" ]; then
+          info "Scanning network for LM Studio on port 1234..."
+          local SCAN_RESULT=$(nmap -p 1234 --open ${IP_BASE}0/24 -T4 --host-timeout 2s 2>/dev/null)
+          local POSSIBLE_HOSTS=$(echo "$SCAN_RESULT" | grep -B 4 "1234/tcp open" | grep "Nmap scan report" | awk '{print $NF}')
+          
+          if [ -n "$POSSIBLE_HOSTS" ]; then
+            # Take the first result
+            found_ip=$(echo "$POSSIBLE_HOSTS" | head -n 1)
+            found_server=true
+          fi
+        fi
+      fi
+      
+      if $found_server; then
+        LM_STUDIO_HOST=$found_ip
+        info "Potential LM Studio server found at $LM_STUDIO_HOST:$LM_STUDIO_PORT"
+      else
+        LM_STUDIO_HOST="192.168.1.100"  # Reasonable guess for a local network
+        info "No LM Studio server discovered automatically. Using $LM_STUDIO_HOST as a placeholder."
+      fi
+    fi
+  else
+    LM_STUDIO_HOST="192.168.1.100"  # Use a reasonable default
+  fi
+  
+  # Create the configuration file with dynamic values
   cat > "${CONFIG_FILE}" << EOF
 # Configuration for llm-launcher.sh
 # Modify these parameters according to your needs
+# Generated dynamically based on system resources
 
 # General settings
 DOCKER_NETWORK="ollama-network"
@@ -388,8 +645,8 @@ OLLAMA_CONTAINER_NAME="ollama-container"
 OLLAMA_CONTAINER_PORT="11434"
 
 # LM Studio remote
-LM_STUDIO_HOST="192.168.1.154"
-LM_STUDIO_PORT="1234"
+LM_STUDIO_HOST="$LM_STUDIO_HOST"
+LM_STUDIO_PORT="$LM_STUDIO_PORT"
 
 # LocalAI with Intel acceleration
 LOCALAI_IMAGE="localai/localai:v2.27.0-sycl-f16-ffmpeg"
@@ -398,7 +655,7 @@ LOCALAI_PORT="8080"
 LOCALAI_MODEL="gemma-3-4b-it-qat"
 LOCALAI_EXTRA_FLAGS="--threads ${THREADS}"
 
-# Memory requirements (detected from system)
+# Memory requirements (detected dynamically from system)
 MEMORY_LIMIT="${MEM_LIMIT}"
 SHM_SIZE="${SHARE_MEM}"
 
@@ -406,7 +663,7 @@ SHM_SIZE="${SHARE_MEM}"
 NETWORK_DIAGNOSTIC_TIMEOUT="2" # seconds for timeout in connectivity tests
 EOF
 
-  success "Configuration file created at: ${CONFIG_FILE}"
+  success "Configuration file created at: ${CONFIG_FILE} with dynamically detected settings"
 }
 
 # Function to edit the configuration file
@@ -930,7 +1187,7 @@ setup_ollama_container() {
   fi
   
   # Set the appropriate GPU device parameter for Intel GPUs
-  local gpu_device_param="iGPU"  # default fallback
+  local gpu_device_param="iGPU"  # Start with a reasonable baseline
   if [[ "$GPU_TYPE" == "INTEL" && -n "$INTEL_GPU_DEVICE" ]]; then
     gpu_device_param="$INTEL_GPU_DEVICE"
   fi
@@ -1390,7 +1647,7 @@ main() {
     echo
     echo "Choose which backend you want to use:"
     echo "1 - Ollama on your local host"
-    echo "2 - LM Studio (uses localhost on macOS, $LM_STUDIO_HOST:$LM_STUDIO_PORT on other systems)"
+    echo "2 - LM Studio (uses localhost on macOS, $LM_STUDIO_HOST on other systems)"
     echo "3 - Ollama in Docker container (with Intel GPU)"
     echo "4 - LocalAI with Intel acceleration (SYCL)"
     read -p "Enter your choice (1/2/3/4): " choice
